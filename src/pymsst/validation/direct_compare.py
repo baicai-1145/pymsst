@@ -13,6 +13,7 @@ from pymss_core import to_plain
 
 from pymsst import __version__
 from pymsst.data.datamodule import MusdbDataModule
+from pymsst.training.cuda_graph import RoformerMaskCoreCudaGraph, normalize_cuda_graph_mode
 from pymsst.training import SeparationLightningModule, compute_loss
 
 
@@ -32,6 +33,15 @@ def run_direct_loss_curve(
     original_root: str | Path = "/root/Music-Source-Separation-Training",
     batch_size: int | None = None,
     chunk_size: int | None = None,
+    num_workers: int = 0,
+    pin_memory: bool = False,
+    persistent_workers: bool = False,
+    loss_record_interval: int = 1,
+    optimizer_backend: str | None = None,
+    cuda_attention_backend: str | None = None,
+    fused_kernel_backend: str | None = None,
+    fused_rms_norm_mode: str | None = None,
+    cuda_graph_mode: str | None = None,
 ) -> dict[str, object]:
     if implementation == "pymsst":
         return _run_pymsst_curve(
@@ -44,8 +54,31 @@ def run_direct_loss_curve(
             start_checkpoint=Path(start_checkpoint) if start_checkpoint else None,
             batch_size=batch_size,
             chunk_size=chunk_size,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers,
+            loss_record_interval=loss_record_interval,
+            optimizer_backend=optimizer_backend,
+            cuda_attention_backend=cuda_attention_backend,
+            fused_kernel_backend=fused_kernel_backend,
+            fused_rms_norm_mode=fused_rms_norm_mode,
+            cuda_graph_mode=cuda_graph_mode,
         )
     if implementation == "original":
+        if optimizer_backend not in {None, "default"}:
+            raise ValueError("--optimizer-backend is only supported for --implementation pymsst")
+        if cuda_attention_backend is not None:
+            raise ValueError("--cuda-attention-backend is only supported for --implementation pymsst")
+        if fused_kernel_backend not in {None, "off"}:
+            raise ValueError("--fused-kernel-backend is only supported for --implementation pymsst")
+        if fused_rms_norm_mode not in {None, "off"}:
+            raise ValueError("--fused-rms-norm-mode is only supported for --implementation pymsst")
+        if cuda_graph_mode not in {None, "off"}:
+            raise ValueError("--cuda-graph-mode is only supported for --implementation pymsst")
+        if num_workers or pin_memory or persistent_workers:
+            raise ValueError("--num-workers/--pin-memory/--persistent-workers are only supported for --implementation pymsst")
+        if loss_record_interval != 1:
+            raise ValueError("--loss-record-interval is only supported for --implementation pymsst")
         return _run_original_curve(
             model_type=model_type,
             config_path=Path(config_path),
@@ -72,6 +105,15 @@ def _run_pymsst_curve(
     start_checkpoint: Path | None,
     batch_size: int | None,
     chunk_size: int | None,
+    num_workers: int,
+    pin_memory: bool,
+    persistent_workers: bool,
+    loss_record_interval: int,
+    optimizer_backend: str | None,
+    cuda_attention_backend: str | None,
+    fused_kernel_backend: str | None,
+    fused_rms_norm_mode: str | None,
+    cuda_graph_mode: str | None,
 ) -> dict[str, object]:
     _seed_everything(seed)
     results_path.mkdir(parents=True, exist_ok=True)
@@ -81,10 +123,32 @@ def _run_pymsst_curve(
         original_loss_compat=True,
         start_checkpoint=start_checkpoint,
         strict_checkpoint=True,
+        optimizer_backend=optimizer_backend,
+        cuda_attention_backend=cuda_attention_backend,
+        fused_kernel_backend=fused_kernel_backend,
+        fused_rms_norm_mode=fused_rms_norm_mode,
     )
     _consume_original_roformer_python_rng(model_type)
     config = module.config
     _apply_overrides(config, steps=steps, batch_size=batch_size, chunk_size=chunk_size)
+    config.training.num_workers = int(num_workers)
+    config.training.pin_memory = bool(pin_memory)
+    config.training.persistent_workers = bool(persistent_workers)
+    config.training.loss_record_interval = int(loss_record_interval)
+    config.training.fused_kernel_backend = module.fused_kernel_backend
+    config.training.fused_rms_norm_mode = module.fused_rms_norm_mode or "off"
+    config.training.fused_kernel_active = module.fused_training_status.active
+    config.training.fused_kernel_patched_band_splits = module.fused_training_status.patched_band_splits
+    config.training.fused_kernel_patched_rotary = module.fused_training_status.patched_rotary
+    config.training.fused_kernel_patched_rms_norm = module.fused_training_status.patched_rms_norm
+    config.training.fused_kernel_rms_norm_mode = module.fused_training_status.rms_norm_mode
+    config.training.fused_kernel_patched_single_stem_masks = module.fused_training_status.patched_single_stem_masks
+    config.training.fused_kernel_patched_attention_gates = module.fused_training_status.patched_attention_gates
+    config.training.fused_kernel_attention_gate_mode = module.fused_training_status.attention_gate_mode
+    if module.fused_training_status.reason:
+        config.training.fused_kernel_reason = module.fused_training_status.reason
+    normalized_cuda_graph_mode = normalize_cuda_graph_mode(cuda_graph_mode)
+    config.training.cuda_graph_mode = normalized_cuda_graph_mode
     batch_size = int(config.training.batch_size)
 
     data = MusdbDataModule(
@@ -98,7 +162,9 @@ def _run_pymsst_curve(
         steps_per_epoch=steps,
         val_tracks=0,
         seed=seed,
-        num_workers=0,
+        num_workers=int(num_workers),
+        pin_memory=bool(pin_memory),
+        persistent_workers=bool(persistent_workers),
         min_mean_abs=float(config.audio.get("min_mean_abs", 0.0)),
         mix_from_stems=True,
         loudness_augmentation=bool(config.get("augmentations", {}).get("enable", False))
@@ -113,6 +179,11 @@ def _run_pymsst_curve(
     module.to(device)
     module.train()
     optimizer = module.configure_optimizers()
+    cuda_graph_runner = (
+        RoformerMaskCoreCudaGraph(module.model, normalized_cuda_graph_mode)
+        if normalized_cuda_graph_mode != "off" and device.type == "cuda"
+        else None
+    )
 
     def loss_fn(prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         return compute_loss(
@@ -132,7 +203,13 @@ def _run_pymsst_curve(
         device=device,
         steps=steps,
         loss_fn=loss_fn,
+        loss_record_interval=loss_record_interval,
+        cuda_graph_runner=cuda_graph_runner,
     )
+    if cuda_graph_runner is not None:
+        config.training.cuda_graph_active = cuda_graph_runner.status.active
+        if cuda_graph_runner.status.reason:
+            config.training.cuda_graph_reason = cuda_graph_runner.status.reason
     return _write_direct_result(
         implementation="pymsst",
         model_type=model_type,
@@ -238,26 +315,37 @@ def _run_manual_steps(
     device: torch.device,
     steps: int,
     loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
-) -> list[float]:
+    loss_record_interval: int = 1,
+    cuda_graph_runner: RoformerMaskCoreCudaGraph | None = None,
+) -> list[tuple[int, float]]:
+    loss_record_interval = int(loss_record_interval)
+    if loss_record_interval < 0:
+        raise ValueError("loss_record_interval must be >= 0")
     use_amp = bool(config.training.get("use_amp", False)) and device.type == "cuda"
     grad_accum = int(config.training.get("gradient_accumulation_steps", 1))
     grad_clip = float(config.training.get("grad_clip", 0) or 0)
     scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
     optimizer.zero_grad(set_to_none=True)
-    losses: list[float] = []
+    losses: list[tuple[int, float]] = []
+    completed_steps = 0
 
     for batch_idx, (target, mixture) in enumerate(dataloader):
         if batch_idx >= steps:
             break
-        target = target.to(device)
-        mixture = mixture.to(device)
+        step = batch_idx + 1
+        target = target.to(device, non_blocking=True)
+        mixture = mixture.to(device, non_blocking=True)
+
+        if cuda_graph_runner is not None and cuda_graph_runner.status.active == "off" and cuda_graph_runner.status.reason is None:
+            cuda_graph_runner.capture(mixture, use_amp=use_amp)
+            optimizer.zero_grad(set_to_none=True)
 
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
-            prediction = model(mixture)
+            prediction = cuda_graph_runner.forward(mixture, use_amp=use_amp) if cuda_graph_runner is not None else model(mixture)
             loss = loss_fn(prediction, target)
 
-        unscaled_loss = float(loss.detach().cpu())
-        losses.append(unscaled_loss)
+        if _should_record_loss(step, steps, loss_record_interval):
+            losses.append((step, float(loss.detach().cpu())))
         scaled_loss = loss / grad_accum
         scaler.scale(scaled_loss).backward()
 
@@ -269,10 +357,15 @@ def _run_manual_steps(
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
+        completed_steps += 1
 
-    if len(losses) != steps:
-        raise RuntimeError(f"expected {steps} train steps, got {len(losses)}")
+    if completed_steps != steps:
+        raise RuntimeError(f"expected {steps} train steps, got {completed_steps}")
     return losses
+
+
+def _should_record_loss(step: int, total_steps: int, interval: int) -> bool:
+    return interval > 0 and (step == 1 or step == total_steps or step % interval == 0)
 
 
 def _write_direct_result(
@@ -285,7 +378,7 @@ def _write_direct_result(
     steps: int,
     seed: int,
     start_checkpoint: Path | None,
-    losses: list[float],
+    losses: list[tuple[int, float]],
     config,
 ) -> dict[str, object]:
     results_path.mkdir(parents=True, exist_ok=True)
@@ -293,13 +386,13 @@ def _write_direct_result(
     with loss_curve_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=LOSS_CURVE_FIELDS)
         writer.writeheader()
-        for index, loss in enumerate(losses):
+        for global_step, loss in losses:
             writer.writerow(
                 {
                     "event": "train",
-                    "global_step": index + 1,
+                    "global_step": global_step,
                     "epoch": 0,
-                    "batch_idx": index,
+                    "batch_idx": global_step - 1,
                     "loss": loss,
                     "val_loss": "",
                     "val_sdr": "",

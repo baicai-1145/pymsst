@@ -43,6 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Match the original training repo's single-stem target shape and masked_loss broadcasting behavior.",
     )
     train.add_argument("--batch-size", type=int)
+    train.add_argument("--chunk-size", type=int)
     train.add_argument("--steps-per-epoch", type=int)
     train.add_argument("--max-epochs", type=int)
     train.add_argument("--max-steps", type=int)
@@ -56,6 +57,15 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--devices", default="auto", help="Lightning devices value: auto, an integer, or comma-separated ids.")
     train.add_argument("--strategy", default="auto")
     train.add_argument("--precision", default="auto")
+    train.add_argument("--optimizer-backend", choices=("default", "foreach", "fused", "fused_capturable"), default=None)
+    train.add_argument("--cuda-attention-backend", choices=("auto", "default", "cudnn", "efficient", "math", "flash"), default=None)
+    train.add_argument("--fused-kernel-backend", choices=("off", "cuda_ext"), default=None)
+    train.add_argument("--fused-rms-norm-mode", choices=("off", "fast", "mixed"), default=None)
+    train.add_argument("--cuda-graph-mode", choices=("off", "mask_core", "stft_mask_core"), default=None)
+    train.add_argument("--train-log-interval", type=int, default=1)
+    train.add_argument("--loss-history-interval", type=int, default=1)
+    train.add_argument("--log-every-n-steps", type=int, default=1)
+    train.add_argument("--disable-progress-bar", action="store_true")
     train.add_argument("--accumulate-grad-batches", type=int)
     train.add_argument("--gradient-clip-val", type=float)
     train.add_argument("--export-core-checkpoint", type=Path)
@@ -116,6 +126,19 @@ def build_parser() -> argparse.ArgumentParser:
     compare_direct.add_argument("--original-root", type=Path, default=Path("/root/Music-Source-Separation-Training"))
     compare_direct.add_argument("--batch-size", type=int)
     compare_direct.add_argument("--chunk-size", type=int)
+    compare_direct.add_argument("--num-workers", type=int, default=0)
+    compare_direct.add_argument("--pin-memory", action="store_true")
+    compare_direct.add_argument("--persistent-workers", action="store_true")
+    compare_direct.add_argument("--loss-record-interval", type=int, default=1)
+    compare_direct.add_argument("--optimizer-backend", choices=("default", "foreach", "fused", "fused_capturable"), default=None)
+    compare_direct.add_argument("--fused-kernel-backend", choices=("off", "cuda_ext"), default=None)
+    compare_direct.add_argument("--fused-rms-norm-mode", choices=("off", "fast", "mixed"), default=None)
+    compare_direct.add_argument("--cuda-graph-mode", choices=("off", "mask_core", "stft_mask_core"), default=None)
+    compare_direct.add_argument(
+        "--cuda-attention-backend",
+        choices=("auto", "default", "cudnn", "efficient", "math", "flash"),
+        default=None,
+    )
     compare_direct.set_defaults(func=_compare_direct)
 
     return parser
@@ -161,9 +184,17 @@ def _train(args: argparse.Namespace) -> int:
         original_loss_compat=args.original_loss_compat,
         start_checkpoint=args.start_checkpoint,
         strict_checkpoint=args.strict_checkpoint,
+        optimizer_backend=args.optimizer_backend,
+        cuda_attention_backend=args.cuda_attention_backend,
+        fused_kernel_backend=args.fused_kernel_backend,
+        fused_rms_norm_mode=args.fused_rms_norm_mode,
+        cuda_graph_mode=args.cuda_graph_mode,
+        train_log_interval=args.train_log_interval,
     )
     _consume_original_roformer_python_rng(args.model_type)
     config = module.config
+    if args.chunk_size is not None:
+        config.audio.chunk_size = int(args.chunk_size)
     batch_size = args.batch_size or int(config.training.batch_size)
     steps_per_epoch = args.steps_per_epoch or int(config.training.num_steps)
     max_epochs = args.max_epochs or int(config.training.num_epochs)
@@ -215,12 +246,33 @@ def _train(args: argparse.Namespace) -> int:
                 "resume_checkpoint": str(args.resume_checkpoint) if args.resume_checkpoint else None,
                 "seed": args.seed,
                 "batch_size": batch_size,
+                "chunk_size": int(config.audio.chunk_size),
                 "steps_per_epoch": steps_per_epoch,
                 "max_epochs": max_epochs,
                 "max_steps": args.max_steps,
                 "accumulate_grad_batches": accumulate_grad_batches,
                 "gradient_clip_val": gradient_clip_val,
                 "precision": precision,
+                "optimizer_backend": module.optimizer_backend,
+                "cuda_attention_backend": module.cuda_attention_backend,
+                "fused_kernel_backend": module.fused_kernel_backend,
+                "fused_rms_norm_mode": module.fused_rms_norm_mode,
+                "fused_kernel_active": module.fused_training_status.active,
+                "fused_kernel_reason": module.fused_training_status.reason,
+                "fused_kernel_patched_band_splits": module.fused_training_status.patched_band_splits,
+                "fused_kernel_patched_rotary": module.fused_training_status.patched_rotary,
+                "fused_kernel_patched_rms_norm": module.fused_training_status.patched_rms_norm,
+                "fused_kernel_rms_norm_mode": module.fused_training_status.rms_norm_mode,
+                "fused_kernel_patched_single_stem_masks": module.fused_training_status.patched_single_stem_masks,
+                "fused_kernel_patched_attention_gates": module.fused_training_status.patched_attention_gates,
+                "fused_kernel_attention_gate_mode": module.fused_training_status.attention_gate_mode,
+                "cuda_graph_mode": module.cuda_graph_mode,
+                "cuda_graph_active": module.cuda_graph_status.active,
+                "cuda_graph_reason": module.cuda_graph_status.reason,
+                "train_log_interval": args.train_log_interval,
+                "loss_history_interval": args.loss_history_interval,
+                "log_every_n_steps": args.log_every_n_steps,
+                "progress_bar": not args.disable_progress_bar,
                 "loss": args.loss,
                 "original_loss_compat": args.original_loss_compat,
                 "loss_history_path": str(loss_history_path),
@@ -260,9 +312,10 @@ def _train(args: argparse.Namespace) -> int:
         accumulate_grad_batches=accumulate_grad_batches,
         gradient_clip_val=gradient_clip_val,
         default_root_dir=run_dir,
-        callbacks=[checkpoint, LossCurveRecorder(loss_history_path)],
+        callbacks=[checkpoint, LossCurveRecorder(loss_history_path, interval=args.loss_history_interval)],
         logger=CSVLogger(save_dir=run_dir, name="logs"),
-        log_every_n_steps=1,
+        log_every_n_steps=args.log_every_n_steps,
+        enable_progress_bar=not args.disable_progress_bar,
         **trainer_kwargs,
     )
     if no_validation:
@@ -270,6 +323,16 @@ def _train(args: argparse.Namespace) -> int:
         trainer.fit(module, train_dataloaders=data.train_dataloader(), ckpt_path=args.resume_checkpoint)
     else:
         trainer.fit(module, datamodule=data, ckpt_path=args.resume_checkpoint)
+
+    if trainer.is_global_zero:
+        _update_json(
+            run_dir / "run_metadata.json",
+            {
+                "cuda_graph_active": module.cuda_graph_status.active,
+                "cuda_graph_reason": module.cuda_graph_status.reason,
+                "config": to_plain(config),
+            },
+        )
 
     if args.export_core_checkpoint and trainer.is_global_zero:
         export_core_checkpoint(
@@ -362,6 +425,15 @@ def _compare_direct(args: argparse.Namespace) -> int:
         original_root=args.original_root,
         batch_size=args.batch_size,
         chunk_size=args.chunk_size,
+        num_workers=args.num_workers,
+        pin_memory=args.pin_memory,
+        persistent_workers=args.persistent_workers,
+        loss_record_interval=args.loss_record_interval,
+        optimizer_backend=args.optimizer_backend,
+        cuda_attention_backend=args.cuda_attention_backend,
+        fused_kernel_backend=args.fused_kernel_backend,
+        fused_rms_norm_mode=args.fused_rms_norm_mode,
+        cuda_graph_mode=args.cuda_graph_mode,
     )
     print(f"Wrote direct loss curve: {metadata['loss_curve_path']}")
     return 0
@@ -404,6 +476,12 @@ def _resolve_precision(value: str, config, cuda_available: bool) -> str:
 def _write_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(_jsonable(payload), indent=2), encoding="utf-8")
+
+
+def _update_json(path: Path, updates: dict) -> None:
+    payload = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+    payload.update(_jsonable(updates))
+    _write_json(path, payload)
 
 
 def _jsonable(value):

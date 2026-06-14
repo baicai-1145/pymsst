@@ -12,8 +12,11 @@ from pytorch_lightning.callbacks import Callback
 class LossCurveRecorder(Callback):
     fieldnames = ("event", "global_step", "epoch", "batch_idx", "loss", "val_loss", "val_sdr")
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, interval: int = 1) -> None:
         self.path = Path(path)
+        self.interval = int(interval)
+        if self.interval < 0:
+            raise ValueError("loss curve recording interval must be >= 0")
 
     def on_fit_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
         if trainer.is_global_zero:
@@ -30,6 +33,8 @@ class LossCurveRecorder(Callback):
         batch_idx: int,
     ) -> None:
         if not trainer.is_global_zero:
+            return
+        if not self.interval or (batch_idx + 1) % self.interval != 0:
             return
         loss = _to_float(trainer.callback_metrics.get("train/loss"))
         if loss is None:
