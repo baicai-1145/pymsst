@@ -1,0 +1,42 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+build/
+dist/
+site/
+
+# Local datasets and pretrained weights.
+musdb18hq/
+pretrained/
+
+# Training outputs.
+checkpoints/
+lightning_logs/
+logs/
+outputs/
+runs/
+runs_smoke/
+wandb/
+
+# Large model and audio artifacts.
+*.ckpt
+*.pt
+*.pth
+*.th
+*.safetensors
+*.wav
+*.flac
+*.mp3
+*.mp4
+*.stem.mp4
+
+# Local environment files.
+.env
+.env.*
+!.env.example

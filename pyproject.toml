@@ -1,0 +1,89 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pymsst"
+version = "0.1.0"
+description = "Training package for pymss music source separation models."
+readme = { file = "README.md", content-type = "text/markdown" }
+requires-python = ">=3.10"
+license = "MIT"
+authors = [
+    { name = "KitsuneX07", email = "ghast1085654218@163.com" },
+]
+maintainers = [
+    { name = "baicai1145", email = "3423714059@qq.com" },
+]
+keywords = [
+    "music source separation",
+    "audio separation",
+    "music processing",
+    "machine learning",
+    "training",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Sound/Audio",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "numpy>=1.26",
+    "pymss-core>=0.1.2",
+    "pytorch-lightning>=2.5",
+    "pyyaml>=6.0.1",
+    "torch>=2.7.1",
+]
+
+[project.optional-dependencies]
+av = [
+    "av>=14",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "ruff>=0.9",
+]
+
+[project.scripts]
+pymsst = "pymsst.cli:main"
+
+[project.urls]
+"Bug Tracker" = "https://github.com/pymss-project/pymsst/issues"
+"Source Code" = "https://github.com/pymss-project/pymsst"
+Documentation = "https://github.com/pymss-project/pymsst/blob/main/README.md"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["pymsst*"]
+
+[tool.uv]
+package = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.ruff]
+target-version = "py310"
+line-length = 128
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+markers = [
+    "integration: tests that require local datasets, pretrained weights, or GPUs",
+]
