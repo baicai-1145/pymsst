@@ -78,12 +78,16 @@ class SeparationLightningModule(pl.LightningModule):
         self.config.training.fused_rms_norm_mode = self.fused_rms_norm_mode or "off"
         self.config.training.fused_kernel_active = self.fused_training_status.active
         self.config.training.fused_kernel_patched_band_splits = self.fused_training_status.patched_band_splits
+        self.config.training.fused_kernel_patched_band_split_bwd_v2 = self.fused_training_status.patched_band_split_bwd_v2
+        self.config.training.fused_kernel_patched_band_split_bwd_v3 = self.fused_training_status.patched_band_split_bwd_v3
         self.config.training.fused_kernel_patched_rotary = self.fused_training_status.patched_rotary
         self.config.training.fused_kernel_patched_rms_norm = self.fused_training_status.patched_rms_norm
         self.config.training.fused_kernel_rms_norm_mode = self.fused_training_status.rms_norm_mode
+        self.config.training.fused_kernel_patched_rms_norm_bwd_v2 = self.fused_training_status.patched_rms_norm_bwd_v2
         self.config.training.fused_kernel_patched_single_stem_masks = self.fused_training_status.patched_single_stem_masks
         self.config.training.fused_kernel_patched_attention_gates = self.fused_training_status.patched_attention_gates
         self.config.training.fused_kernel_attention_gate_mode = self.fused_training_status.attention_gate_mode
+        self.config.training.fused_kernel_patched_layout_reduce_copy = self.fused_training_status.patched_layout_reduce_copy
         if self.fused_training_status.reason:
             self.config.training.fused_kernel_reason = self.fused_training_status.reason
         self.cuda_graph_mode = normalize_cuda_graph_mode(
@@ -118,12 +122,16 @@ class SeparationLightningModule(pl.LightningModule):
                 "fused_rms_norm_mode": self.fused_rms_norm_mode,
                 "fused_kernel_active": self.fused_training_status.active,
                 "fused_kernel_patched_band_splits": self.fused_training_status.patched_band_splits,
+                "fused_kernel_patched_band_split_bwd_v2": self.fused_training_status.patched_band_split_bwd_v2,
+                "fused_kernel_patched_band_split_bwd_v3": self.fused_training_status.patched_band_split_bwd_v3,
                 "fused_kernel_patched_rotary": self.fused_training_status.patched_rotary,
                 "fused_kernel_patched_rms_norm": self.fused_training_status.patched_rms_norm,
                 "fused_kernel_rms_norm_mode": self.fused_training_status.rms_norm_mode,
+                "fused_kernel_patched_rms_norm_bwd_v2": self.fused_training_status.patched_rms_norm_bwd_v2,
                 "fused_kernel_patched_single_stem_masks": self.fused_training_status.patched_single_stem_masks,
                 "fused_kernel_patched_attention_gates": self.fused_training_status.patched_attention_gates,
                 "fused_kernel_attention_gate_mode": self.fused_training_status.attention_gate_mode,
+                "fused_kernel_patched_layout_reduce_copy": self.fused_training_status.patched_layout_reduce_copy,
                 "cuda_graph_mode": self.cuda_graph_mode,
                 "cuda_graph_active": self.cuda_graph_status.active,
                 "train_log_interval": self.train_log_interval,

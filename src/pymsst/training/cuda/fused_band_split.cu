@@ -309,6 +309,281 @@ std::vector<at::Tensor> band_split_backward_cuda(
 }
 
 template <typename scalar_t>
+__global__ void band_split_backward_input_v2_kernel(
+    const scalar_t* __restrict__ grad_out,
+    const scalar_t* __restrict__ normed,
+    const float* __restrict__ inv_norm,
+    const scalar_t* __restrict__ gamma,
+    const scalar_t* __restrict__ weight,
+    scalar_t* __restrict__ grad_x,
+    int64_t m_count,
+    int64_t group_count,
+    int64_t in_features,
+    int64_t out_features) {
+  extern __shared__ float shared[];
+  float* reduction = shared;
+  float* grad_normed_cache = shared + blockDim.x;
+  const int64_t m = blockIdx.x;
+  const int64_t g = blockIdx.y;
+  const int tid = threadIdx.x;
+  const float scale = sqrtf(static_cast<float>(in_features));
+  const float inv = inv_norm[m * group_count + g];
+
+  float dot_partial = 0.0f;
+  for (int64_t i = tid; i < in_features; i += blockDim.x) {
+    float grad_scaled = 0.0f;
+    for (int64_t o = 0; o < out_features; ++o) {
+      grad_scaled += static_cast<float>(grad_out[(m * group_count + g) * out_features + o]) *
+                     static_cast<float>(weight[(g * out_features + o) * in_features + i]);
+    }
+    const float grad_normed = grad_scaled * static_cast<float>(gamma[g * in_features + i]);
+    grad_normed_cache[i] = grad_normed;
+    dot_partial += grad_normed * static_cast<float>(normed[(m * group_count + g) * in_features + i]);
+  }
+
+  reduction[tid] = dot_partial;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      reduction[tid] += reduction[tid + stride];
+    }
+    __syncthreads();
+  }
+  const float dot = reduction[0];
+
+  for (int64_t i = tid; i < in_features; i += blockDim.x) {
+    const float normed_value = static_cast<float>(normed[(m * group_count + g) * in_features + i]);
+    const float value = inv * (grad_normed_cache[i] * scale - normed_value * (dot / scale));
+    grad_x[(m * group_count + g) * in_features + i] = static_cast<scalar_t>(value);
+  }
+}
+
+std::vector<at::Tensor> band_split_backward_v2_cuda(
+    const at::Tensor& grad_out,
+    const at::Tensor& normed,
+    const at::Tensor& inv_norm,
+    const at::Tensor& gamma,
+    const at::Tensor& weight,
+    bool has_bias) {
+  const c10::cuda::CUDAGuard device_guard(grad_out.device());
+
+  const auto m_count = grad_out.size(0);
+  const auto group_count = grad_out.size(1);
+  const auto out_features = grad_out.size(2);
+  const auto in_features = normed.size(2);
+
+  const int threads = 256;
+  const size_t input_shared_bytes = (threads + static_cast<size_t>(in_features)) * sizeof(float);
+  if (input_shared_bytes > 48 * 1024) {
+    return band_split_backward_cuda(grad_out, normed, inv_norm, gamma, weight, has_bias);
+  }
+
+  auto grad_x = at::empty_like(normed);
+  auto grad_gamma = at::empty_like(gamma);
+  auto grad_weight = at::empty_like(weight);
+  at::Tensor grad_bias = has_bias ? at::empty({group_count, out_features}, grad_out.options()) : at::Tensor();
+
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const size_t shared_bytes = threads * sizeof(float);
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::Half,
+      at::ScalarType::BFloat16,
+      grad_out.scalar_type(),
+      "band_split_backward_v2_cuda",
+      [&] {
+        band_split_backward_input_v2_kernel<scalar_t><<<dim3(m_count, group_count), threads, input_shared_bytes, stream>>>(
+            grad_out.data_ptr<scalar_t>(),
+            normed.data_ptr<scalar_t>(),
+            inv_norm.data_ptr<float>(),
+            gamma.data_ptr<scalar_t>(),
+            weight.data_ptr<scalar_t>(),
+            grad_x.data_ptr<scalar_t>(),
+            m_count,
+            group_count,
+            in_features,
+            out_features);
+        band_split_backward_weight_bias_kernel<scalar_t><<<dim3(group_count, out_features), threads, 0, stream>>>(
+            grad_out.data_ptr<scalar_t>(),
+            normed.data_ptr<scalar_t>(),
+            gamma.data_ptr<scalar_t>(),
+            grad_weight.data_ptr<scalar_t>(),
+            has_bias ? grad_bias.data_ptr<scalar_t>() : nullptr,
+            m_count,
+            group_count,
+            in_features,
+            out_features);
+        band_split_backward_gamma_kernel<scalar_t><<<dim3(group_count, in_features), threads, shared_bytes, stream>>>(
+            grad_out.data_ptr<scalar_t>(),
+            normed.data_ptr<scalar_t>(),
+            weight.data_ptr<scalar_t>(),
+            grad_gamma.data_ptr<scalar_t>(),
+            m_count,
+            group_count,
+            in_features,
+            out_features);
+      });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  return {grad_x, grad_gamma, grad_weight, grad_bias};
+}
+
+template <typename scalar_t>
+__global__ void band_split_backward_input_v3_kernel(
+    const scalar_t* __restrict__ grad_out,
+    const scalar_t* __restrict__ normed,
+    const float* __restrict__ inv_norm,
+    const scalar_t* __restrict__ gamma,
+    const scalar_t* __restrict__ weight,
+    scalar_t* __restrict__ grad_x,
+    float* __restrict__ grad_scaled_cache,
+    int64_t m_count,
+    int64_t group_count,
+    int64_t in_features,
+    int64_t out_features) {
+  extern __shared__ float shared[];
+  float* reduction = shared;
+  float* grad_normed_cache = shared + blockDim.x;
+  const int64_t m = blockIdx.x;
+  const int64_t g = blockIdx.y;
+  const int tid = threadIdx.x;
+  const float scale = sqrtf(static_cast<float>(in_features));
+  const float inv = inv_norm[m * group_count + g];
+
+  float dot_partial = 0.0f;
+  for (int64_t i = tid; i < in_features; i += blockDim.x) {
+    float grad_scaled = 0.0f;
+    for (int64_t o = 0; o < out_features; ++o) {
+      grad_scaled += static_cast<float>(grad_out[(m * group_count + g) * out_features + o]) *
+                     static_cast<float>(weight[(g * out_features + o) * in_features + i]);
+    }
+    const float grad_normed = grad_scaled * static_cast<float>(gamma[g * in_features + i]);
+    grad_scaled_cache[(m * group_count + g) * in_features + i] = grad_scaled;
+    grad_normed_cache[i] = grad_normed;
+    dot_partial += grad_normed * static_cast<float>(normed[(m * group_count + g) * in_features + i]);
+  }
+
+  reduction[tid] = dot_partial;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      reduction[tid] += reduction[tid + stride];
+    }
+    __syncthreads();
+  }
+  const float dot = reduction[0];
+
+  for (int64_t i = tid; i < in_features; i += blockDim.x) {
+    const float normed_value = static_cast<float>(normed[(m * group_count + g) * in_features + i]);
+    const float value = inv * (grad_normed_cache[i] * scale - normed_value * (dot / scale));
+    grad_x[(m * group_count + g) * in_features + i] = static_cast<scalar_t>(value);
+  }
+}
+
+template <typename scalar_t>
+__global__ void band_split_backward_gamma_from_scaled_kernel(
+    const float* __restrict__ grad_scaled_cache,
+    const scalar_t* __restrict__ normed,
+    scalar_t* __restrict__ grad_gamma,
+    int64_t m_count,
+    int64_t group_count,
+    int64_t in_features) {
+  const int64_t g = blockIdx.x;
+  const int64_t i = blockIdx.y;
+  const int tid = threadIdx.x;
+
+  float acc = 0.0f;
+  for (int64_t m = tid; m < m_count; m += blockDim.x) {
+    acc += grad_scaled_cache[(m * group_count + g) * in_features + i] *
+           static_cast<float>(normed[(m * group_count + g) * in_features + i]);
+  }
+
+  extern __shared__ float shared[];
+  shared[tid] = acc;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      shared[tid] += shared[tid + stride];
+    }
+    __syncthreads();
+  }
+  if (tid == 0) {
+    grad_gamma[g * in_features + i] = static_cast<scalar_t>(shared[0]);
+  }
+}
+
+std::vector<at::Tensor> band_split_backward_v3_cuda(
+    const at::Tensor& grad_out,
+    const at::Tensor& normed,
+    const at::Tensor& inv_norm,
+    const at::Tensor& gamma,
+    const at::Tensor& weight,
+    bool has_bias) {
+  const c10::cuda::CUDAGuard device_guard(grad_out.device());
+
+  const auto m_count = grad_out.size(0);
+  const auto group_count = grad_out.size(1);
+  const auto out_features = grad_out.size(2);
+  const auto in_features = normed.size(2);
+
+  const int threads = 256;
+  const size_t input_shared_bytes = (threads + static_cast<size_t>(in_features)) * sizeof(float);
+  if (input_shared_bytes > 48 * 1024) {
+    return band_split_backward_v2_cuda(grad_out, normed, inv_norm, gamma, weight, has_bias);
+  }
+
+  auto grad_x = at::empty_like(normed);
+  auto grad_gamma = at::empty_like(gamma);
+  auto grad_weight = at::empty_like(weight);
+  auto grad_scaled_cache = at::empty({m_count, group_count, in_features}, grad_out.options().dtype(at::kFloat));
+  at::Tensor grad_bias = has_bias ? at::empty({group_count, out_features}, grad_out.options()) : at::Tensor();
+
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const size_t shared_bytes = threads * sizeof(float);
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::Half,
+      at::ScalarType::BFloat16,
+      grad_out.scalar_type(),
+      "band_split_backward_v3_cuda",
+      [&] {
+        band_split_backward_input_v3_kernel<scalar_t><<<dim3(m_count, group_count), threads, input_shared_bytes, stream>>>(
+            grad_out.data_ptr<scalar_t>(),
+            normed.data_ptr<scalar_t>(),
+            inv_norm.data_ptr<float>(),
+            gamma.data_ptr<scalar_t>(),
+            weight.data_ptr<scalar_t>(),
+            grad_x.data_ptr<scalar_t>(),
+            grad_scaled_cache.data_ptr<float>(),
+            m_count,
+            group_count,
+            in_features,
+            out_features);
+        band_split_backward_weight_bias_kernel<scalar_t><<<dim3(group_count, out_features), threads, 0, stream>>>(
+            grad_out.data_ptr<scalar_t>(),
+            normed.data_ptr<scalar_t>(),
+            gamma.data_ptr<scalar_t>(),
+            grad_weight.data_ptr<scalar_t>(),
+            has_bias ? grad_bias.data_ptr<scalar_t>() : nullptr,
+            m_count,
+            group_count,
+            in_features,
+            out_features);
+        band_split_backward_gamma_from_scaled_kernel<scalar_t>
+            <<<dim3(group_count, in_features), threads, shared_bytes, stream>>>(
+                grad_scaled_cache.data_ptr<float>(),
+                normed.data_ptr<scalar_t>(),
+                grad_gamma.data_ptr<scalar_t>(),
+                m_count,
+                group_count,
+                in_features);
+      });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  return {grad_x, grad_gamma, grad_weight, grad_bias};
+}
+
+template <typename scalar_t>
 __global__ void grouped_linear_forward_kernel(
     const scalar_t* __restrict__ x,
     const scalar_t* __restrict__ weight,
@@ -694,6 +969,195 @@ std::vector<at::Tensor> rms_norm_backward_cuda(
             grad_out_contiguous.data_ptr<scalar_t>(),
             normed_contiguous.data_ptr<scalar_t>(),
             grad_gamma.data_ptr<scalar_t>(),
+            row_count,
+            dim);
+      });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  return {grad_x, grad_gamma};
+}
+
+template <typename scalar_t>
+__global__ void rms_norm_forward_fp32_gamma_kernel(
+    const scalar_t* __restrict__ x,
+    const float* __restrict__ gamma,
+    scalar_t* __restrict__ out,
+    scalar_t* __restrict__ normed,
+    float* __restrict__ inv_norm,
+    int64_t row_count,
+    int64_t dim) {
+  extern __shared__ float shared[];
+  const int64_t row = blockIdx.x;
+  const int tid = threadIdx.x;
+
+  float sum_sq = 0.0f;
+  for (int64_t i = tid; i < dim; i += blockDim.x) {
+    const float value = static_cast<float>(x[row * dim + i]);
+    sum_sq += value * value;
+  }
+  shared[tid] = sum_sq;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      shared[tid] += shared[tid + stride];
+    }
+    __syncthreads();
+  }
+
+  const float scale = sqrtf(static_cast<float>(dim));
+  const float norm = fmaxf(sqrtf(shared[0]), 1.0e-12f);
+  const float inv = 1.0f / norm;
+  if (tid == 0) {
+    inv_norm[row] = inv;
+  }
+
+  for (int64_t i = tid; i < dim; i += blockDim.x) {
+    const float normalized = static_cast<float>(x[row * dim + i]) * inv * scale;
+    normed[row * dim + i] = static_cast<scalar_t>(normalized);
+    out[row * dim + i] = static_cast<scalar_t>(normalized * gamma[i]);
+  }
+}
+
+template <typename scalar_t>
+__global__ void rms_norm_backward_fp32_gamma_input_kernel(
+    const scalar_t* __restrict__ grad_out,
+    const scalar_t* __restrict__ normed,
+    const float* __restrict__ inv_norm,
+    const float* __restrict__ gamma,
+    scalar_t* __restrict__ grad_x,
+    int64_t row_count,
+    int64_t dim) {
+  extern __shared__ float shared[];
+  const int64_t row = blockIdx.x;
+  const int tid = threadIdx.x;
+  const float scale = sqrtf(static_cast<float>(dim));
+  const float inv = inv_norm[row];
+
+  float dot_partial = 0.0f;
+  for (int64_t i = tid; i < dim; i += blockDim.x) {
+    const float grad_normed = static_cast<float>(grad_out[row * dim + i]) * gamma[i];
+    dot_partial += grad_normed * static_cast<float>(normed[row * dim + i]);
+  }
+  shared[tid] = dot_partial;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      shared[tid] += shared[tid + stride];
+    }
+    __syncthreads();
+  }
+  const float dot = shared[0];
+
+  for (int64_t i = tid; i < dim; i += blockDim.x) {
+    const float grad_normed = static_cast<float>(grad_out[row * dim + i]) * gamma[i];
+    const float normed_value = static_cast<float>(normed[row * dim + i]);
+    const float value = inv * (grad_normed * scale - normed_value * (dot / scale));
+    grad_x[row * dim + i] = static_cast<scalar_t>(value);
+  }
+}
+
+template <typename scalar_t>
+__global__ void rms_norm_backward_fp32_gamma_kernel(
+    const scalar_t* __restrict__ grad_out,
+    const scalar_t* __restrict__ normed,
+    float* __restrict__ grad_gamma,
+    int64_t row_count,
+    int64_t dim) {
+  extern __shared__ float shared[];
+  const int64_t i = blockIdx.x;
+  const int tid = threadIdx.x;
+
+  float acc = 0.0f;
+  for (int64_t row = tid; row < row_count; row += blockDim.x) {
+    acc += static_cast<float>(grad_out[row * dim + i]) * static_cast<float>(normed[row * dim + i]);
+  }
+  shared[tid] = acc;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      shared[tid] += shared[tid + stride];
+    }
+    __syncthreads();
+  }
+  if (tid == 0) {
+    grad_gamma[i] = shared[0];
+  }
+}
+
+std::vector<at::Tensor> rms_norm_forward_fp32_gamma_cuda(
+    const at::Tensor& x,
+    const at::Tensor& gamma) {
+  const c10::cuda::CUDAGuard device_guard(x.device());
+  auto x_contiguous = x.contiguous();
+  auto gamma_contiguous = gamma.contiguous();
+
+  const auto dim = x_contiguous.size(-1);
+  const auto row_count = x_contiguous.numel() / dim;
+  auto out = at::empty_like(x_contiguous);
+  auto normed = at::empty_like(x_contiguous);
+  auto inv_norm = at::empty({row_count}, x_contiguous.options().dtype(at::kFloat));
+
+  const int threads = 256;
+  const size_t shared_bytes = threads * sizeof(float);
+  const auto stream = at::cuda::getCurrentCUDAStream();
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::Half,
+      at::ScalarType::BFloat16,
+      x.scalar_type(),
+      "rms_norm_forward_fp32_gamma_cuda",
+      [&] {
+        rms_norm_forward_fp32_gamma_kernel<scalar_t><<<row_count, threads, shared_bytes, stream>>>(
+            x_contiguous.data_ptr<scalar_t>(),
+            gamma_contiguous.data_ptr<float>(),
+            out.data_ptr<scalar_t>(),
+            normed.data_ptr<scalar_t>(),
+            inv_norm.data_ptr<float>(),
+            row_count,
+            dim);
+      });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  return {out, normed, inv_norm};
+}
+
+std::vector<at::Tensor> rms_norm_backward_fp32_gamma_cuda(
+    const at::Tensor& grad_out,
+    const at::Tensor& normed,
+    const at::Tensor& inv_norm,
+    const at::Tensor& gamma) {
+  const c10::cuda::CUDAGuard device_guard(grad_out.device());
+  auto grad_out_contiguous = grad_out.contiguous();
+  auto normed_contiguous = normed.contiguous();
+  auto gamma_contiguous = gamma.contiguous();
+
+  const auto dim = grad_out_contiguous.size(-1);
+  const auto row_count = grad_out_contiguous.numel() / dim;
+  auto grad_x = at::empty_like(grad_out_contiguous);
+  auto grad_gamma = at::empty_like(gamma_contiguous);
+
+  const int threads = 256;
+  const size_t shared_bytes = threads * sizeof(float);
+  const auto stream = at::cuda::getCurrentCUDAStream();
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::Half,
+      at::ScalarType::BFloat16,
+      grad_out.scalar_type(),
+      "rms_norm_backward_fp32_gamma_cuda",
+      [&] {
+        rms_norm_backward_fp32_gamma_input_kernel<scalar_t><<<row_count, threads, shared_bytes, stream>>>(
+            grad_out_contiguous.data_ptr<scalar_t>(),
+            normed_contiguous.data_ptr<scalar_t>(),
+            inv_norm.data_ptr<float>(),
+            gamma_contiguous.data_ptr<float>(),
+            grad_x.data_ptr<scalar_t>(),
+            row_count,
+            dim);
+        rms_norm_backward_fp32_gamma_kernel<scalar_t><<<dim, threads, shared_bytes, stream>>>(
+            grad_out_contiguous.data_ptr<scalar_t>(),
+            normed_contiguous.data_ptr<scalar_t>(),
+            grad_gamma.data_ptr<float>(),
             row_count,
             dim);
       });

@@ -139,12 +139,16 @@ def _run_pymsst_curve(
     config.training.fused_rms_norm_mode = module.fused_rms_norm_mode or "off"
     config.training.fused_kernel_active = module.fused_training_status.active
     config.training.fused_kernel_patched_band_splits = module.fused_training_status.patched_band_splits
+    config.training.fused_kernel_patched_band_split_bwd_v2 = module.fused_training_status.patched_band_split_bwd_v2
+    config.training.fused_kernel_patched_band_split_bwd_v3 = module.fused_training_status.patched_band_split_bwd_v3
     config.training.fused_kernel_patched_rotary = module.fused_training_status.patched_rotary
     config.training.fused_kernel_patched_rms_norm = module.fused_training_status.patched_rms_norm
     config.training.fused_kernel_rms_norm_mode = module.fused_training_status.rms_norm_mode
+    config.training.fused_kernel_patched_rms_norm_bwd_v2 = module.fused_training_status.patched_rms_norm_bwd_v2
     config.training.fused_kernel_patched_single_stem_masks = module.fused_training_status.patched_single_stem_masks
     config.training.fused_kernel_patched_attention_gates = module.fused_training_status.patched_attention_gates
     config.training.fused_kernel_attention_gate_mode = module.fused_training_status.attention_gate_mode
+    config.training.fused_kernel_patched_layout_reduce_copy = module.fused_training_status.patched_layout_reduce_copy
     if module.fused_training_status.reason:
         config.training.fused_kernel_reason = module.fused_training_status.reason
     normalized_cuda_graph_mode = normalize_cuda_graph_mode(cuda_graph_mode)

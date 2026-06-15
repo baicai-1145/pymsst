@@ -9,7 +9,13 @@ from pymss_core import get_model_from_config, load_model_weights
 
 from pymsst.export import export_core_checkpoint
 from pymsst.training.fused_extension import FusedKernelUnavailable
-from pymsst.training.fused_roformer import apply_roformer_fused_training_backend
+from pymsst.training.fused_roformer import (
+    _copy_band_group,
+    _contiguous_index_range,
+    _select_band_group,
+    apply_roformer_fused_training_backend,
+    normalize_fused_rms_norm_mode,
+)
 from pymsst.training import SeparationLightningModule, compute_loss, masked_loss
 
 
@@ -225,6 +231,27 @@ def test_fused_kernel_backend_can_patch_band_split_without_building_extension(tm
     assert module.model.band_split._pymsst_fused_band_split is True
 
 
+def test_band_split_bwd_v3_env_takes_precedence_over_v2(tmp_path, monkeypatch):
+    class FakeExtension:
+        def band_split_backward_v2(self):
+            raise AssertionError("not called")
+
+        def band_split_backward_v3(self):
+            raise AssertionError("not called")
+
+    monkeypatch.setenv("PYMSST_EXPERIMENTAL_BANDSPLIT_BWD_V2", "1")
+    monkeypatch.setenv("PYMSST_EXPERIMENTAL_BANDSPLIT_BWD_V3", "1")
+    module = SeparationLightningModule(model_type="bs_roformer", config_path=_write_config(tmp_path, "bs_roformer"))
+
+    status = apply_roformer_fused_training_backend(module.model, "cuda_ext", extension=FakeExtension())
+
+    assert status.active == "cuda_ext"
+    assert status.patched_band_splits == 1
+    assert status.patched_band_split_bwd_v2 is False
+    assert status.patched_band_split_bwd_v3 is True
+    assert module.model.band_split._pymsst_fused_band_split_bwd_mode == "v3"
+
+
 def test_fused_kernel_backend_rejects_unknown_value(tmp_path):
     with pytest.raises(ValueError, match="fused_kernel_backend"):
         SeparationLightningModule(
@@ -234,6 +261,46 @@ def test_fused_kernel_backend_rejects_unknown_value(tmp_path):
         )
 
 
+def test_layout_reduce_copy_helpers_slice_contiguous_band_indices():
+    x = torch.arange(2 * 4 * 3, dtype=torch.float32).reshape(2, 4, 3)
+    index_calls = 0
+
+    def index_tensor(indices, device):
+        nonlocal index_calls
+        index_calls += 1
+        return torch.as_tensor(indices, device=device)
+
+    assert _contiguous_index_range((1, 2)) == (1, 3)
+
+    selected = _select_band_group(x, (1, 2), x.device, index_tensor)
+
+    assert index_calls == 0
+    assert torch.equal(selected, x[..., 1:3, :])
+
+    destination = torch.zeros_like(x)
+    _copy_band_group(destination, (1, 2), selected, x.device, index_tensor)
+
+    assert index_calls == 0
+    assert torch.equal(destination[..., 1:3, :], selected)
+
+
+def test_layout_reduce_copy_helpers_keep_index_select_for_noncontiguous_band_indices():
+    x = torch.arange(2 * 4 * 3, dtype=torch.float32).reshape(2, 4, 3)
+    index_calls = 0
+
+    def index_tensor(indices, device):
+        nonlocal index_calls
+        index_calls += 1
+        return torch.as_tensor(indices, device=device)
+
+    assert _contiguous_index_range((0, 2)) is None
+
+    selected = _select_band_group(x, (0, 2), x.device, index_tensor)
+
+    assert index_calls == 1
+    assert torch.equal(selected, x.index_select(-2, torch.tensor((0, 2))))
+
+
 def test_fused_rms_norm_mode_rejects_unknown_value(tmp_path):
     with pytest.raises(ValueError, match="fused_rms_norm_mode"):
         SeparationLightningModule(
@@ -241,6 +308,18 @@ def test_fused_rms_norm_mode_rejects_unknown_value(tmp_path):
             config_path=_write_config(tmp_path, "bs_roformer"),
             fused_rms_norm_mode="unknown",
         )
+
+
+def test_rms_norm_bwd_v2_env_enables_fast_rms_norm_mode(monkeypatch):
+    monkeypatch.delenv("PYMSST_EXPERIMENTAL_FUSED_RMSNORM", raising=False)
+    monkeypatch.delenv("PYMSST_EXPERIMENTAL_RMSNORM_BWD_V2", raising=False)
+
+    assert normalize_fused_rms_norm_mode(None) is None
+
+    monkeypatch.setenv("PYMSST_EXPERIMENTAL_RMSNORM_BWD_V2", "1")
+
+    assert normalize_fused_rms_norm_mode(None) == "fast"
+    assert normalize_fused_rms_norm_mode("off") is None
 
 
 def test_cuda_graph_mode_rejects_unknown_value(tmp_path):

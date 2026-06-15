@@ -14,9 +14,13 @@ from .fused_extension import FusedKernelUnavailable, load_fused_band_split_exten
 
 CORE_GROUPED_TRAIN_ENV = "PYMSS_CORE_EXPERIMENTAL_TRAIN_GROUPED_BANDS"
 EXPERIMENTAL_GROUPED_LINEAR_ENV = "PYMSST_EXPERIMENTAL_FUSED_GROUPED_LINEAR"
+EXPERIMENTAL_BAND_SPLIT_BWD_V2_ENV = "PYMSST_EXPERIMENTAL_BANDSPLIT_BWD_V2"
+EXPERIMENTAL_BAND_SPLIT_BWD_V3_ENV = "PYMSST_EXPERIMENTAL_BANDSPLIT_BWD_V3"
 EXPERIMENTAL_ROTARY_ENV = "PYMSST_EXPERIMENTAL_FUSED_ROTARY"
 EXPERIMENTAL_RMS_NORM_ENV = "PYMSST_EXPERIMENTAL_FUSED_RMSNORM"
+EXPERIMENTAL_RMS_NORM_BWD_V2_ENV = "PYMSST_EXPERIMENTAL_RMSNORM_BWD_V2"
 EXPERIMENTAL_ATTENTION_GATES_ENV = "PYMSST_EXPERIMENTAL_FUSED_ATTENTION_GATES"
+EXPERIMENTAL_LAYOUT_REDUCE_COPY_ENV = "PYMSST_EXPERIMENTAL_LAYOUT_REDUCE_COPY"
 
 
 @dataclass(frozen=True)
@@ -25,12 +29,16 @@ class FusedTrainingStatus:
     active: str
     reason: str | None = None
     patched_band_splits: int = 0
+    patched_band_split_bwd_v2: bool = False
+    patched_band_split_bwd_v3: bool = False
     patched_rotary: bool = False
     patched_rms_norm: bool = False
     rms_norm_mode: str | None = None
+    patched_rms_norm_bwd_v2: bool = False
     patched_single_stem_masks: bool = False
     patched_attention_gates: bool = False
     attention_gate_mode: str | None = None
+    patched_layout_reduce_copy: bool = False
 
 
 def apply_roformer_fused_training_backend(
@@ -53,14 +61,21 @@ def apply_roformer_fused_training_backend(
         warnings.warn(str(exc), RuntimeWarning, stacklevel=2)
         return FusedTrainingStatus(requested=normalized, active="off", reason=str(exc))
 
-    patched = _patch_band_split_modules(model, ext)
+    band_split_bwd_mode = _experimental_band_split_bwd_mode(ext)
+    patched = _patch_band_split_modules(model, ext, bwd_mode=band_split_bwd_mode)
     patched_single_stem_masks = _patch_single_stem_mask_estimation()
     patched_rotary = _patch_core_rotary(ext) if _experimental_rotary_enabled() else False
     normalized_rms_norm_mode = normalize_fused_rms_norm_mode(rms_norm_mode)
-    patched_rms_norm = _patch_core_rms_norm(ext, normalized_rms_norm_mode) if normalized_rms_norm_mode else False
+    use_rms_norm_bwd_v2 = _experimental_rms_norm_bwd_v2_enabled(ext, normalized_rms_norm_mode)
+    patched_rms_norm = (
+        _patch_core_rms_norm(ext, normalized_rms_norm_mode, use_bwd_v2=use_rms_norm_bwd_v2)
+        if normalized_rms_norm_mode
+        else False
+    )
     attention_gate_mode = _experimental_attention_gates_mode()
     patched_attention_gates = _patch_core_attention_gates(ext, attention_gate_mode) if attention_gate_mode else False
     patched_grouped_linear = _patch_core_grouped_linear(ext) if _experimental_grouped_linear_enabled() else False
+    patched_layout_reduce_copy = _patch_core_layout_reduce_copy() if _experimental_layout_reduce_copy_enabled() else False
     if (
         not patched
         and not patched_single_stem_masks
@@ -68,6 +83,7 @@ def apply_roformer_fused_training_backend(
         and not patched_rms_norm
         and not patched_attention_gates
         and not patched_grouped_linear
+        and not patched_layout_reduce_copy
     ):
         reason = "no compatible pymss-core BandSplit modules were found"
         warnings.warn(reason, RuntimeWarning, stacklevel=2)
@@ -78,12 +94,16 @@ def apply_roformer_fused_training_backend(
         requested=normalized,
         active=normalized,
         patched_band_splits=patched,
+        patched_band_split_bwd_v2=patched > 0 and band_split_bwd_mode == "v2",
+        patched_band_split_bwd_v3=patched > 0 and band_split_bwd_mode == "v3",
         patched_rotary=patched_rotary,
         patched_rms_norm=patched_rms_norm,
         rms_norm_mode=normalized_rms_norm_mode if patched_rms_norm else None,
+        patched_rms_norm_bwd_v2=patched_rms_norm and use_rms_norm_bwd_v2,
         patched_single_stem_masks=patched_single_stem_masks,
         patched_attention_gates=patched_attention_gates,
         attention_gate_mode=attention_gate_mode if patched_attention_gates else None,
+        patched_layout_reduce_copy=patched_layout_reduce_copy,
     )
 
 
@@ -98,7 +118,10 @@ def normalize_fused_kernel_backend(value: str | None) -> str:
 
 def normalize_fused_rms_norm_mode(value: str | None) -> str | None:
     if value is None:
-        return _experimental_rms_norm_mode()
+        mode = _experimental_rms_norm_mode()
+        if mode is not None:
+            return mode
+        return "fast" if _experimental_rms_norm_bwd_v2_requested() else None
     mode = str(value).strip().lower().replace("-", "_")
     if mode in {"", "none", "false", "0", "off", "default"}:
         return None
@@ -111,6 +134,20 @@ def normalize_fused_rms_norm_mode(value: str | None) -> str | None:
 
 def _experimental_grouped_linear_enabled() -> bool:
     return os.environ.get(EXPERIMENTAL_GROUPED_LINEAR_ENV, "").lower() in {"1", "true", "yes", "on"}
+
+
+def _experimental_band_split_bwd_mode(extension: Any) -> str | None:
+    if (
+        os.environ.get(EXPERIMENTAL_BAND_SPLIT_BWD_V3_ENV, "").lower() in {"1", "true", "yes", "on"}
+        and hasattr(extension, "band_split_backward_v3")
+    ):
+        return "v3"
+    if (
+        os.environ.get(EXPERIMENTAL_BAND_SPLIT_BWD_V2_ENV, "").lower() in {"1", "true", "yes", "on"}
+        and hasattr(extension, "band_split_backward_v2")
+    ):
+        return "v2"
+    return None
 
 
 def _experimental_rotary_enabled() -> bool:
@@ -128,6 +165,20 @@ def _experimental_rms_norm_mode() -> str | None:
     return None
 
 
+def _experimental_rms_norm_bwd_v2_enabled(extension: Any, mode: str | None) -> bool:
+    if mode != "fast":
+        return False
+    return (
+        _experimental_rms_norm_bwd_v2_requested()
+        and hasattr(extension, "rms_norm_forward_fp32_gamma")
+        and hasattr(extension, "rms_norm_backward_fp32_gamma")
+    )
+
+
+def _experimental_rms_norm_bwd_v2_requested() -> bool:
+    return os.environ.get(EXPERIMENTAL_RMS_NORM_BWD_V2_ENV, "").lower() in {"1", "true", "yes", "on"}
+
+
 def _experimental_attention_gates_mode() -> str | None:
     value = os.environ.get(EXPERIMENTAL_ATTENTION_GATES_ENV, "").strip().lower()
     if value in {"", "0", "false", "no", "off"}:
@@ -137,7 +188,11 @@ def _experimental_attention_gates_mode() -> str | None:
     return None
 
 
-def _patch_band_split_modules(model: torch.nn.Module, extension: Any) -> int:
+def _experimental_layout_reduce_copy_enabled() -> bool:
+    return os.environ.get(EXPERIMENTAL_LAYOUT_REDUCE_COPY_ENV, "").lower() in {"1", "true", "yes", "on"}
+
+
+def _patch_band_split_modules(model: torch.nn.Module, extension: Any, *, bwd_mode: str | None = None) -> int:
     patched = 0
     for module in model.modules():
         if module.__class__.__name__ != "BandSplit":
@@ -148,6 +203,7 @@ def _patch_band_split_modules(model: torch.nn.Module, extension: Any) -> int:
             continue
         module._pymsst_original_forward_grouped = module._forward_grouped
         module._pymsst_fused_extension = extension
+        module._pymsst_fused_band_split_bwd_mode = bwd_mode
         module._forward_grouped = types.MethodType(_forward_grouped_band_split_cuda_ext, module)
         module._pymsst_fused_band_split = True
         patched += 1
@@ -201,6 +257,217 @@ def _patch_single_stem_mask_estimation() -> bool:
     return True
 
 
+def _patch_core_layout_reduce_copy() -> bool:
+    try:
+        import pymss_core.modules.bs_roformer.bands as bands
+    except Exception:
+        return False
+    patched = False
+
+    if not getattr(bands.MaskEstimator._forward_layer_grouped_mlp, "_pymsst_layout_reduce_copy", False):
+        original_forward_layer_grouped_mlp = bands.MaskEstimator._forward_layer_grouped_mlp
+
+        def forward_layer_grouped_mlp_layout_reduce_copy(self, x: torch.Tensor):
+            plan = self._layer_grouping_plan()
+            if plan is None:
+                return None
+
+            group_x = x
+            for layer_index, (kind, groups) in enumerate(plan):
+                if kind == "tanh":
+                    group_x = bands.inference_tanh(group_x)
+                    continue
+
+                out_dims = {signature[1] for signature, _ in groups}
+                if len(out_dims) != 1:
+                    if layer_index != len(plan) - 1:
+                        return None
+                    outs = [None] * len(self.to_freqs)
+                    for signature, indices in groups:
+                        weight, bias = self._get_layer_group_params(layer_index, signature, indices, x.device, x.dtype)
+                        selected = _select_band_group(group_x, indices, x.device, self._indices_tensor)
+                        out = F.glu(bands.grouped_linear(selected, weight, bias), dim=-1)
+                        for band_position, band_out in zip(indices, out.unbind(dim=-2)):
+                            outs[band_position] = band_out
+                    return torch.cat(outs, dim=-1)
+
+                next_x = None
+                for signature, indices in groups:
+                    weight, bias = self._get_layer_group_params(layer_index, signature, indices, x.device, x.dtype)
+                    selected = _select_band_group(group_x, indices, x.device, self._indices_tensor)
+                    out = bands.grouped_linear(selected, weight, bias)
+                    if next_x is None:
+                        next_x = out.new_empty(*group_x.shape[:-1], out.shape[-1])
+                    _copy_band_group(next_x, indices, out, x.device, self._indices_tensor)
+                group_x = next_x
+
+            return F.glu(group_x, dim=-1).flatten(start_dim=-2)
+
+        forward_layer_grouped_mlp_layout_reduce_copy._pymsst_layout_reduce_copy = True
+        forward_layer_grouped_mlp_layout_reduce_copy._pymsst_original_forward_layer_grouped_mlp = (
+            original_forward_layer_grouped_mlp
+        )
+        bands.MaskEstimator._forward_layer_grouped_mlp = forward_layer_grouped_mlp_layout_reduce_copy
+        patched = True
+
+    if not getattr(bands.BandSplit._get_group_params, "_pymsst_layout_reduce_copy", False):
+        original_band_split_get_group_params = bands.BandSplit._get_group_params
+
+        def band_split_get_group_params_layout_reduce_copy(self, start, end, device, dtype):
+            key = (start, end, device.type, device.index, dtype)
+            use_cache = not self.training
+            if use_cache:
+                cached = self._group_cache.get(key)
+                if cached is not None:
+                    return cached
+
+            norms = [self.to_features[i][0] for i in range(start, end)]
+            linears = [self.to_features[i][1] for i in range(start, end)]
+            gamma = _stack_converted_tensors([norm.gamma for norm in norms], device, dtype)
+            weight = _stack_converted_tensors([linear.weight for linear in linears], device, dtype)
+            bias = _stack_converted_tensors([linear.bias for linear in linears], device, dtype) if linears[0].bias is not None else None
+            cached = (gamma, weight, bias)
+            if use_cache:
+                self._group_cache[key] = cached
+            return cached
+
+        band_split_get_group_params_layout_reduce_copy._pymsst_layout_reduce_copy = True
+        band_split_get_group_params_layout_reduce_copy._pymsst_original_get_group_params = original_band_split_get_group_params
+        bands.BandSplit._get_group_params = band_split_get_group_params_layout_reduce_copy
+        patched = True
+
+    if not getattr(bands.MaskEstimator._get_group_params, "_pymsst_layout_reduce_copy", False):
+        original_mask_get_group_params = bands.MaskEstimator._get_group_params
+
+        def mask_get_group_params_layout_reduce_copy(self, start, end, device, dtype):
+            key = (start, end, device.type, device.index, dtype)
+            use_cache = not self.training
+            if use_cache:
+                cached = self._group_cache.get(key)
+                if cached is not None:
+                    return cached
+
+            grouped_layers = []
+            band_layers = self._band_groupable_layers()
+            first_layers = band_layers[start]
+            for layer_index, (kind, _) in enumerate(first_layers):
+                if kind == "tanh":
+                    grouped_layers.append(("tanh", None, None))
+                    continue
+
+                linears = [band_layers[i][layer_index][1] for i in range(start, end)]
+                weight = _stack_converted_tensors([linear.weight for linear in linears], device, dtype)
+                bias = _stack_converted_tensors([linear.bias for linear in linears], device, dtype) if linears[0].bias is not None else None
+                grouped_layers.append(("linear", weight, bias))
+
+            cached = tuple(grouped_layers)
+            if use_cache:
+                self._group_cache[key] = cached
+            return cached
+
+        mask_get_group_params_layout_reduce_copy._pymsst_layout_reduce_copy = True
+        mask_get_group_params_layout_reduce_copy._pymsst_original_get_group_params = original_mask_get_group_params
+        bands.MaskEstimator._get_group_params = mask_get_group_params_layout_reduce_copy
+        patched = True
+
+    if not getattr(bands.MaskEstimator._get_layer_group_params, "_pymsst_layout_reduce_copy", False):
+        original_get_layer_group_params = bands.MaskEstimator._get_layer_group_params
+
+        def get_layer_group_params_layout_reduce_copy(self, layer_index, signature, indices, device, dtype):
+            key = (layer_index, signature, indices, device.type, device.index, dtype)
+            use_cache = not self.training
+            if use_cache:
+                cached = self._layer_group_cache.get(key)
+                if cached is not None:
+                    return cached
+
+            band_layers = self._band_groupable_layers()
+            linears = [band_layers[i][layer_index][1] for i in indices]
+            weight = _stack_converted_tensors([linear.weight for linear in linears], device, dtype)
+            bias = _stack_converted_tensors([linear.bias for linear in linears], device, dtype) if linears[0].bias is not None else None
+
+            cached = (weight, bias)
+            if use_cache:
+                self._layer_group_cache[key] = cached
+            return cached
+
+        get_layer_group_params_layout_reduce_copy._pymsst_layout_reduce_copy = True
+        get_layer_group_params_layout_reduce_copy._pymsst_original_get_layer_group_params = original_get_layer_group_params
+        bands.MaskEstimator._get_layer_group_params = get_layer_group_params_layout_reduce_copy
+        patched = True
+
+    if not getattr(bands.MaskEstimator._get_packed_layer_group_params, "_pymsst_layout_reduce_copy", False):
+        original_get_packed_layer_group_params = bands.MaskEstimator._get_packed_layer_group_params
+
+        def get_packed_layer_group_params_layout_reduce_copy(self, estimators, layer_index, signature, indices, device, dtype):
+            estimator_ids = tuple(id(estimator) for estimator in estimators)
+            key = (estimator_ids, layer_index, signature, indices, device.type, device.index, dtype)
+            use_cache = not any(estimator.training for estimator in estimators)
+            if use_cache:
+                cached = self._packed_layer_group_cache.get(key)
+                if cached is not None:
+                    return cached
+
+            linears = [
+                estimator._band_groupable_layers()[band_index][layer_index][1]
+                for estimator in estimators
+                for band_index in indices
+            ]
+            weight = _stack_converted_tensors([linear.weight for linear in linears], device, dtype)
+            bias = _stack_converted_tensors([linear.bias for linear in linears], device, dtype) if linears[0].bias is not None else None
+
+            cached = (weight, bias)
+            if use_cache:
+                self._packed_layer_group_cache[key] = cached
+            return cached
+
+        get_packed_layer_group_params_layout_reduce_copy._pymsst_layout_reduce_copy = True
+        get_packed_layer_group_params_layout_reduce_copy._pymsst_original_get_packed_layer_group_params = (
+            original_get_packed_layer_group_params
+        )
+        bands.MaskEstimator._get_packed_layer_group_params = get_packed_layer_group_params_layout_reduce_copy
+        patched = True
+
+    return patched
+
+
+def _contiguous_index_range(indices: tuple[int, ...]) -> tuple[int, int] | None:
+    if not indices:
+        return None
+    start = int(indices[0])
+    end = int(indices[-1]) + 1
+    return (start, end) if indices == tuple(range(start, end)) else None
+
+
+def _select_band_group(x: torch.Tensor, indices: tuple[int, ...], device: torch.device, index_tensor_fn) -> torch.Tensor:
+    contiguous = _contiguous_index_range(indices)
+    if contiguous is not None:
+        start, end = contiguous
+        return x[..., start:end, :]
+    return x.index_select(-2, index_tensor_fn(indices, device))
+
+
+def _copy_band_group(
+    destination: torch.Tensor,
+    indices: tuple[int, ...],
+    source: torch.Tensor,
+    device: torch.device,
+    index_tensor_fn,
+) -> None:
+    contiguous = _contiguous_index_range(indices)
+    if contiguous is not None:
+        start, end = contiguous
+        destination[..., start:end, :] = source
+        return
+    destination.index_copy_(-2, index_tensor_fn(indices, device), source)
+
+
+def _stack_converted_tensors(tensors: list[torch.Tensor], device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    if len(tensors) == 1:
+        return tensors[0].to(device=device, dtype=dtype).unsqueeze(0)
+    return torch.stack([tensor.to(device=device, dtype=dtype) for tensor in tensors], dim=0)
+
+
 def _patch_core_rotary(extension: Any) -> bool:
     if not hasattr(extension, "rotary_forward") or not hasattr(extension, "rotary_backward"):
         return False
@@ -226,11 +493,15 @@ def _patch_core_rotary(extension: Any) -> bool:
     return True
 
 
-def _patch_core_rms_norm(extension: Any, mode: str) -> bool:
+def _patch_core_rms_norm(extension: Any, mode: str, *, use_bwd_v2: bool = False) -> bool:
     if mode == "mixed":
         required = ("rms_norm_forward_mixed", "rms_norm_backward_mixed")
     elif mode == "fast":
-        required = ("rms_norm_forward", "rms_norm_backward")
+        required = (
+            ("rms_norm_forward_fp32_gamma", "rms_norm_backward_fp32_gamma")
+            if use_bwd_v2
+            else ("rms_norm_forward", "rms_norm_backward")
+        )
     else:
         return False
 
@@ -248,6 +519,8 @@ def _patch_core_rms_norm(extension: Any, mode: str) -> bool:
     def rms_norm_cuda_ext(self, x: torch.Tensor):
         if not self.training or x.device.type != "cuda" or x.dtype not in (torch.float16, torch.bfloat16, torch.float32):
             return original_forward(self, x)
+        if use_bwd_v2 and mode == "fast" and self.gamma.dtype == torch.float32:
+            return _FusedRMSNormFp32Gamma.apply(x, self.gamma, extension)
         if mode == "mixed" and self.gamma.dtype == torch.float32:
             return _FusedRMSNormMixed.apply(x, self.gamma, extension)
         gamma = self.gamma.to(device=x.device, dtype=x.dtype)
@@ -255,6 +528,7 @@ def _patch_core_rms_norm(extension: Any, mode: str) -> bool:
 
     rms_norm_cuda_ext._pymsst_fused_rms_norm = True
     rms_norm_cuda_ext._pymsst_fused_rms_norm_mode = mode
+    rms_norm_cuda_ext._pymsst_fused_rms_norm_bwd_v2 = use_bwd_v2
     rms_norm_cuda_ext._pymsst_original_forward = original_forward
     transformer.RMSNorm.forward = rms_norm_cuda_ext
     return True
@@ -318,6 +592,7 @@ def _forward_grouped_band_split_cuda_ext(self, x: torch.Tensor) -> torch.Tensor:
         return self._pymsst_original_forward_grouped(x)
 
     ext = self._pymsst_fused_extension
+    bwd_mode = getattr(self, "_pymsst_fused_band_split_bwd_mode", None)
     leading_shape = x.shape[:-1]
     outs = []
     for start, end, dim_in in self._dim_groups:
@@ -325,24 +600,45 @@ def _forward_grouped_band_split_cuda_ext(self, x: torch.Tensor) -> torch.Tensor:
         offset_end = self._dim_offsets[end]
         group_x = x[..., offset_start:offset_end].reshape(-1, end - start, dim_in)
         gamma, weight, bias = self._get_group_params(start, end, x.device, x.dtype)
-        outs.append(_FusedBandSplitGroup.apply(group_x, gamma, weight, bias, ext).reshape(*leading_shape, end - start, -1))
+        outs.append(
+            _FusedBandSplitGroup.apply(group_x, gamma, weight, bias, ext, bwd_mode).reshape(
+                *leading_shape,
+                end - start,
+                -1,
+            )
+        )
     return torch.cat(outs, dim=-2)
 
 
 class _FusedBandSplitGroup(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x: torch.Tensor, gamma: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None, extension):
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        gamma: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None,
+        extension,
+        bwd_mode: str | None,
+    ):
         out, normed, inv_norm = extension.band_split_forward(x, gamma, weight, bias)
         ctx.save_for_backward(normed, inv_norm, gamma, weight)
         ctx.has_bias = bias is not None
         ctx.extension = extension
+        ctx.bwd_mode = bwd_mode
         return out
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
         normed, inv_norm, gamma, weight = ctx.saved_tensors
         grad_out = grad_out.reshape(normed.shape[0], normed.shape[1], weight.shape[1]).contiguous()
-        grad_x, grad_gamma, grad_weight, grad_bias = ctx.extension.band_split_backward(
+        if ctx.bwd_mode == "v3":
+            backward = ctx.extension.band_split_backward_v3
+        elif ctx.bwd_mode == "v2":
+            backward = ctx.extension.band_split_backward_v2
+        else:
+            backward = ctx.extension.band_split_backward
+        grad_x, grad_gamma, grad_weight, grad_bias = backward(
             grad_out,
             normed,
             inv_norm,
@@ -352,7 +648,7 @@ class _FusedBandSplitGroup(torch.autograd.Function):
         )
         if not ctx.has_bias:
             grad_bias = None
-        return grad_x, grad_gamma, grad_weight, grad_bias, None
+        return grad_x, grad_gamma, grad_weight, grad_bias, None, None
 
 
 class _FusedGroupedLinear(torch.autograd.Function):
@@ -405,6 +701,27 @@ class _FusedRMSNorm(torch.autograd.Function):
     def backward(ctx, grad_out: torch.Tensor):
         normed, inv_norm, gamma = ctx.saved_tensors
         grad_x, grad_gamma = ctx.extension.rms_norm_backward(grad_out.reshape(ctx.input_shape), normed, inv_norm, gamma)
+        return grad_x.reshape(ctx.input_shape), grad_gamma, None
+
+
+class _FusedRMSNormFp32Gamma(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, gamma: torch.Tensor, extension):
+        out, normed, inv_norm = extension.rms_norm_forward_fp32_gamma(x, gamma)
+        ctx.input_shape = tuple(x.shape)
+        ctx.save_for_backward(normed, inv_norm, gamma)
+        ctx.extension = extension
+        return out.reshape_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):
+        normed, inv_norm, gamma = ctx.saved_tensors
+        grad_x, grad_gamma = ctx.extension.rms_norm_backward_fp32_gamma(
+            grad_out.reshape(ctx.input_shape),
+            normed,
+            inv_norm,
+            gamma,
+        )
         return grad_x.reshape(ctx.input_shape), grad_gamma, None
 
 

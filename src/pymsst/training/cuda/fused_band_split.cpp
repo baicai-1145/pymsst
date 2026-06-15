@@ -16,6 +16,22 @@ std::vector<at::Tensor> band_split_backward_cuda(
     const at::Tensor& weight,
     bool has_bias);
 
+std::vector<at::Tensor> band_split_backward_v2_cuda(
+    const at::Tensor& grad_out,
+    const at::Tensor& normed,
+    const at::Tensor& inv_norm,
+    const at::Tensor& gamma,
+    const at::Tensor& weight,
+    bool has_bias);
+
+std::vector<at::Tensor> band_split_backward_v3_cuda(
+    const at::Tensor& grad_out,
+    const at::Tensor& normed,
+    const at::Tensor& inv_norm,
+    const at::Tensor& gamma,
+    const at::Tensor& weight,
+    bool has_bias);
+
 at::Tensor grouped_linear_forward_cuda(
     const at::Tensor& x,
     const at::Tensor& weight,
@@ -36,6 +52,16 @@ std::vector<at::Tensor> rms_norm_forward_cuda(
     const at::Tensor& gamma);
 
 std::vector<at::Tensor> rms_norm_backward_cuda(
+    const at::Tensor& grad_out,
+    const at::Tensor& normed,
+    const at::Tensor& inv_norm,
+    const at::Tensor& gamma);
+
+std::vector<at::Tensor> rms_norm_forward_fp32_gamma_cuda(
+    const at::Tensor& x,
+    const at::Tensor& gamma);
+
+std::vector<at::Tensor> rms_norm_backward_fp32_gamma_cuda(
     const at::Tensor& grad_out,
     const at::Tensor& normed,
     const at::Tensor& inv_norm,
@@ -127,6 +153,72 @@ std::vector<at::Tensor> band_split_backward(
   TORCH_CHECK(weight.scalar_type() == grad_out.scalar_type(), "weight dtype must match grad_out");
   TORCH_CHECK(inv_norm.scalar_type() == at::kFloat, "inv_norm must be float32");
   return band_split_backward_cuda(grad_out, normed, inv_norm, gamma, weight, has_bias);
+}
+
+std::vector<at::Tensor> band_split_backward_v2(
+    const at::Tensor& grad_out,
+    const at::Tensor& normed,
+    const at::Tensor& inv_norm,
+    const at::Tensor& gamma,
+    const at::Tensor& weight,
+    bool has_bias) {
+  TORCH_CHECK(grad_out.is_cuda(), "grad_out must be a CUDA tensor");
+  TORCH_CHECK(normed.is_cuda(), "normed must be a CUDA tensor");
+  TORCH_CHECK(inv_norm.is_cuda(), "inv_norm must be a CUDA tensor");
+  TORCH_CHECK(gamma.is_cuda(), "gamma must be a CUDA tensor");
+  TORCH_CHECK(weight.is_cuda(), "weight must be a CUDA tensor");
+  TORCH_CHECK(grad_out.dim() == 3, "grad_out must have shape [M, G, O]");
+  TORCH_CHECK(normed.dim() == 3, "normed must have shape [M, G, I]");
+  TORCH_CHECK(inv_norm.dim() == 2, "inv_norm must have shape [M, G]");
+  TORCH_CHECK(gamma.dim() == 2, "gamma must have shape [G, I]");
+  TORCH_CHECK(weight.dim() == 3, "weight must have shape [G, O, I]");
+  TORCH_CHECK(normed.size(0) == grad_out.size(0), "normed M must match grad_out");
+  TORCH_CHECK(normed.size(1) == grad_out.size(1), "normed G must match grad_out");
+  TORCH_CHECK(inv_norm.size(0) == grad_out.size(0), "inv_norm M must match grad_out");
+  TORCH_CHECK(inv_norm.size(1) == grad_out.size(1), "inv_norm G must match grad_out");
+  TORCH_CHECK(gamma.size(0) == grad_out.size(1), "gamma G must match grad_out");
+  TORCH_CHECK(gamma.size(1) == normed.size(2), "gamma I must match normed");
+  TORCH_CHECK(weight.size(0) == grad_out.size(1), "weight G must match grad_out");
+  TORCH_CHECK(weight.size(1) == grad_out.size(2), "weight O must match grad_out");
+  TORCH_CHECK(weight.size(2) == normed.size(2), "weight I must match normed");
+  TORCH_CHECK(normed.scalar_type() == grad_out.scalar_type(), "normed dtype must match grad_out");
+  TORCH_CHECK(gamma.scalar_type() == grad_out.scalar_type(), "gamma dtype must match grad_out");
+  TORCH_CHECK(weight.scalar_type() == grad_out.scalar_type(), "weight dtype must match grad_out");
+  TORCH_CHECK(inv_norm.scalar_type() == at::kFloat, "inv_norm must be float32");
+  return band_split_backward_v2_cuda(grad_out, normed, inv_norm, gamma, weight, has_bias);
+}
+
+std::vector<at::Tensor> band_split_backward_v3(
+    const at::Tensor& grad_out,
+    const at::Tensor& normed,
+    const at::Tensor& inv_norm,
+    const at::Tensor& gamma,
+    const at::Tensor& weight,
+    bool has_bias) {
+  TORCH_CHECK(grad_out.is_cuda(), "grad_out must be a CUDA tensor");
+  TORCH_CHECK(normed.is_cuda(), "normed must be a CUDA tensor");
+  TORCH_CHECK(inv_norm.is_cuda(), "inv_norm must be a CUDA tensor");
+  TORCH_CHECK(gamma.is_cuda(), "gamma must be a CUDA tensor");
+  TORCH_CHECK(weight.is_cuda(), "weight must be a CUDA tensor");
+  TORCH_CHECK(grad_out.dim() == 3, "grad_out must have shape [M, G, O]");
+  TORCH_CHECK(normed.dim() == 3, "normed must have shape [M, G, I]");
+  TORCH_CHECK(inv_norm.dim() == 2, "inv_norm must have shape [M, G]");
+  TORCH_CHECK(gamma.dim() == 2, "gamma must have shape [G, I]");
+  TORCH_CHECK(weight.dim() == 3, "weight must have shape [G, O, I]");
+  TORCH_CHECK(normed.size(0) == grad_out.size(0), "normed M must match grad_out");
+  TORCH_CHECK(normed.size(1) == grad_out.size(1), "normed G must match grad_out");
+  TORCH_CHECK(inv_norm.size(0) == grad_out.size(0), "inv_norm M must match grad_out");
+  TORCH_CHECK(inv_norm.size(1) == grad_out.size(1), "inv_norm G must match grad_out");
+  TORCH_CHECK(gamma.size(0) == grad_out.size(1), "gamma G must match grad_out");
+  TORCH_CHECK(gamma.size(1) == normed.size(2), "gamma I must match normed");
+  TORCH_CHECK(weight.size(0) == grad_out.size(1), "weight G must match grad_out");
+  TORCH_CHECK(weight.size(1) == grad_out.size(2), "weight O must match grad_out");
+  TORCH_CHECK(weight.size(2) == normed.size(2), "weight I must match normed");
+  TORCH_CHECK(normed.scalar_type() == grad_out.scalar_type(), "normed dtype must match grad_out");
+  TORCH_CHECK(gamma.scalar_type() == grad_out.scalar_type(), "gamma dtype must match grad_out");
+  TORCH_CHECK(weight.scalar_type() == grad_out.scalar_type(), "weight dtype must match grad_out");
+  TORCH_CHECK(inv_norm.scalar_type() == at::kFloat, "inv_norm must be float32");
+  return band_split_backward_v3_cuda(grad_out, normed, inv_norm, gamma, weight, has_bias);
 }
 
 at::Tensor grouped_linear_forward(
@@ -231,6 +323,39 @@ std::vector<at::Tensor> rms_norm_backward(
   return rms_norm_backward_cuda(grad_out, normed, inv_norm, gamma);
 }
 
+std::vector<at::Tensor> rms_norm_forward_fp32_gamma(
+    const at::Tensor& x,
+    const at::Tensor& gamma) {
+  TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
+  TORCH_CHECK(gamma.is_cuda(), "gamma must be a CUDA tensor");
+  TORCH_CHECK(x.dim() >= 2, "x must have at least 2 dimensions");
+  TORCH_CHECK(gamma.dim() == 1, "gamma must have shape [D]");
+  TORCH_CHECK(gamma.size(0) == x.size(-1), "gamma dimension must match x last dimension");
+  TORCH_CHECK(gamma.scalar_type() == at::kFloat, "gamma must be float32");
+  return rms_norm_forward_fp32_gamma_cuda(x, gamma);
+}
+
+std::vector<at::Tensor> rms_norm_backward_fp32_gamma(
+    const at::Tensor& grad_out,
+    const at::Tensor& normed,
+    const at::Tensor& inv_norm,
+    const at::Tensor& gamma) {
+  TORCH_CHECK(grad_out.is_cuda(), "grad_out must be a CUDA tensor");
+  TORCH_CHECK(normed.is_cuda(), "normed must be a CUDA tensor");
+  TORCH_CHECK(inv_norm.is_cuda(), "inv_norm must be a CUDA tensor");
+  TORCH_CHECK(gamma.is_cuda(), "gamma must be a CUDA tensor");
+  TORCH_CHECK(grad_out.dim() >= 2, "grad_out must have at least 2 dimensions");
+  TORCH_CHECK(normed.sizes() == grad_out.sizes(), "normed shape must match grad_out");
+  TORCH_CHECK(gamma.dim() == 1, "gamma must have shape [D]");
+  TORCH_CHECK(gamma.size(0) == grad_out.size(-1), "gamma dimension must match grad_out last dimension");
+  TORCH_CHECK(inv_norm.dim() == 1, "inv_norm must have shape [M]");
+  TORCH_CHECK(inv_norm.size(0) * gamma.size(0) == grad_out.numel(), "inv_norm length must match flattened rows");
+  TORCH_CHECK(normed.scalar_type() == grad_out.scalar_type(), "normed dtype must match grad_out");
+  TORCH_CHECK(gamma.scalar_type() == at::kFloat, "gamma must be float32");
+  TORCH_CHECK(inv_norm.scalar_type() == at::kFloat, "inv_norm must be float32");
+  return rms_norm_backward_fp32_gamma_cuda(grad_out, normed, inv_norm, gamma);
+}
+
 std::vector<at::Tensor> rms_norm_forward_mixed(
     const at::Tensor& x,
     const at::Tensor& gamma) {
@@ -323,11 +448,15 @@ std::vector<at::Tensor> attention_gate_backward(
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("band_split_forward", &band_split_forward, "Fused BandSplit grouped forward");
   m.def("band_split_backward", &band_split_backward, "Fused BandSplit grouped backward");
+  m.def("band_split_backward_v2", &band_split_backward_v2, "Fused BandSplit grouped backward v2");
+  m.def("band_split_backward_v3", &band_split_backward_v3, "Fused BandSplit grouped backward v3");
   m.def("grouped_linear_forward", &grouped_linear_forward, "Fused grouped linear forward");
   m.def("rotary_forward", &rotary_forward, "Fused rotary embedding forward");
   m.def("rotary_backward", &rotary_backward, "Fused rotary embedding backward");
   m.def("rms_norm_forward", &rms_norm_forward, "Fused RMSNorm forward");
   m.def("rms_norm_backward", &rms_norm_backward, "Fused RMSNorm backward");
+  m.def("rms_norm_forward_fp32_gamma", &rms_norm_forward_fp32_gamma, "Fused RMSNorm forward with FP32 gamma");
+  m.def("rms_norm_backward_fp32_gamma", &rms_norm_backward_fp32_gamma, "Fused RMSNorm backward with FP32 gamma");
   m.def("rms_norm_forward_mixed", &rms_norm_forward_mixed, "Fused mixed-dtype RMSNorm forward");
   m.def("rms_norm_backward_mixed", &rms_norm_backward_mixed, "Fused mixed-dtype RMSNorm backward");
   m.def("attention_gate_forward", &attention_gate_forward, "Fused attention gate forward");
