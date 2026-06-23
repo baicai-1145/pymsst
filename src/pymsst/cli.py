@@ -62,6 +62,7 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--fused-kernel-backend", choices=("off", "cuda_ext"), default=None)
     train.add_argument("--fused-rms-norm-mode", choices=("off", "fast", "mixed"), default=None)
     train.add_argument("--cuda-graph-mode", choices=("off", "mask_core", "stft_mask_core"), default=None)
+    train.add_argument("--runtime-optimization-preset", choices=("off", "train_fragmentation", "high_util"), default=None)
     train.add_argument("--train-log-interval", type=int, default=1)
     train.add_argument("--loss-history-interval", type=int, default=1)
     train.add_argument("--log-every-n-steps", type=int, default=1)
@@ -134,6 +135,7 @@ def build_parser() -> argparse.ArgumentParser:
     compare_direct.add_argument("--fused-kernel-backend", choices=("off", "cuda_ext"), default=None)
     compare_direct.add_argument("--fused-rms-norm-mode", choices=("off", "fast", "mixed"), default=None)
     compare_direct.add_argument("--cuda-graph-mode", choices=("off", "mask_core", "stft_mask_core"), default=None)
+    compare_direct.add_argument("--runtime-optimization-preset", choices=("off", "train_fragmentation", "high_util"), default=None)
     compare_direct.add_argument(
         "--cuda-attention-backend",
         choices=("auto", "default", "cudnn", "efficient", "math", "flash"),
@@ -215,6 +217,7 @@ def _train(args: argparse.Namespace) -> int:
         fused_kernel_backend=args.fused_kernel_backend,
         fused_rms_norm_mode=args.fused_rms_norm_mode,
         cuda_graph_mode=args.cuda_graph_mode,
+        runtime_optimization_preset=args.runtime_optimization_preset,
         train_log_interval=args.train_log_interval,
     )
     _consume_original_roformer_python_rng(args.model_type)
@@ -280,6 +283,7 @@ def _train(args: argparse.Namespace) -> int:
                 "gradient_clip_val": gradient_clip_val,
                 "precision": precision,
                 "optimizer_backend": module.optimizer_backend,
+                "runtime_optimization_preset": module.runtime_optimization_preset,
                 "cuda_attention_backend": module.cuda_attention_backend,
                 "fused_kernel_backend": module.fused_kernel_backend,
                 "fused_rms_norm_mode": module.fused_rms_norm_mode,
@@ -488,6 +492,7 @@ def _compare_direct(args: argparse.Namespace) -> int:
         fused_kernel_backend=args.fused_kernel_backend,
         fused_rms_norm_mode=args.fused_rms_norm_mode,
         cuda_graph_mode=args.cuda_graph_mode,
+        runtime_optimization_preset=args.runtime_optimization_preset,
     )
     print(f"Wrote direct loss curve: {metadata['loss_curve_path']}")
     return 0

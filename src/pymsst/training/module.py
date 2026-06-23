@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,31 @@ from .losses import compute_loss, signal_to_distortion_ratio
 
 
 DEFAULT_TRAIN_CUDA_ATTENTION_BACKEND = "default"
+RUNTIME_OPTIMIZATION_PRESETS = {"off", "train_fragmentation", "high_util"}
+TRAIN_FRAGMENTATION_ENV = {
+    "PYMSST_EXPERIMENTAL_BANDSPLIT_BWD_V3": "1",
+    "PYMSST_EXPERIMENTAL_BANDSPLIT_RAGGED_FORWARD": "1",
+    "PYMSST_EXPERIMENTAL_BANDSPLIT_RAGGED_BACKWARD": "1",
+    "PYMSST_EXPERIMENTAL_RMSNORM_BWD_V2": "1",
+    "PYMSST_EXPERIMENTAL_LAYOUT_REDUCE_COPY": "1",
+    "PYMSST_EXPERIMENTAL_MASK_FINAL_AUTOGRAD": "1",
+    "PYMSST_EXPERIMENTAL_MASK_ESTIMATOR_FINAL_DIRECT": "1",
+}
+TRAIN_FRAGMENTATION_DEFAULTS = {
+    "fused_kernel_backend": "cuda_ext",
+    "fused_rms_norm_mode": "fast",
+    "cuda_attention_backend": DEFAULT_TRAIN_CUDA_ATTENTION_BACKEND,
+    "cuda_graph_mode": "off",
+}
+HIGH_UTIL_ENV = {
+    **TRAIN_FRAGMENTATION_ENV,
+}
+HIGH_UTIL_DEFAULTS = {
+    "fused_kernel_backend": "cuda_ext",
+    "fused_rms_norm_mode": "fast",
+    "cuda_attention_backend": DEFAULT_TRAIN_CUDA_ATTENTION_BACKEND,
+    "cuda_graph_mode": "mask_core",
+}
 
 
 class SeparationLightningModule(pl.LightningModule):
@@ -37,6 +63,7 @@ class SeparationLightningModule(pl.LightningModule):
         fused_kernel_backend: str | None = None,
         fused_rms_norm_mode: str | None = None,
         cuda_graph_mode: str | None = None,
+        runtime_optimization_preset: str | None = None,
         train_log_interval: int = 1,
     ) -> None:
         super().__init__()
@@ -59,18 +86,34 @@ class SeparationLightningModule(pl.LightningModule):
         self.optimizer_backend = _normalize_optimizer_backend(
             optimizer_backend if optimizer_backend is not None else self.config.training.get("optimizer_backend", "default")
         )
+        self.runtime_optimization_preset = _normalize_runtime_optimization_preset(
+            runtime_optimization_preset
+            if runtime_optimization_preset is not None
+            else self.config.training.get("runtime_optimization_preset")
+        )
+        runtime_defaults = _runtime_optimization_defaults(self.runtime_optimization_preset)
+        _apply_runtime_optimization_environment(self.runtime_optimization_preset)
         configured_cuda_attention_backend = (
             cuda_attention_backend if cuda_attention_backend is not None else self.config.training.get("cuda_attention_backend")
         )
-        self.cuda_attention_backend = _optional_string(configured_cuda_attention_backend) or DEFAULT_TRAIN_CUDA_ATTENTION_BACKEND
+        self.cuda_attention_backend = (
+            _optional_string(configured_cuda_attention_backend)
+            or runtime_defaults.get("cuda_attention_backend")
+            or DEFAULT_TRAIN_CUDA_ATTENTION_BACKEND
+        )
         self.config.training.optimizer_backend = self.optimizer_backend
+        self.config.training.runtime_optimization_preset = self.runtime_optimization_preset
         _set_cuda_attention_backend(self.model, self.cuda_attention_backend)
         self.config.training.cuda_attention_backend = self.cuda_attention_backend
         self.fused_kernel_backend = normalize_fused_kernel_backend(
-            fused_kernel_backend if fused_kernel_backend is not None else self.config.training.get("fused_kernel_backend")
+            fused_kernel_backend
+            if fused_kernel_backend is not None
+            else self.config.training.get("fused_kernel_backend", runtime_defaults.get("fused_kernel_backend"))
         )
         self.fused_rms_norm_mode = normalize_fused_rms_norm_mode(
-            fused_rms_norm_mode if fused_rms_norm_mode is not None else self.config.training.get("fused_rms_norm_mode")
+            fused_rms_norm_mode
+            if fused_rms_norm_mode is not None
+            else self.config.training.get("fused_rms_norm_mode", runtime_defaults.get("fused_rms_norm_mode"))
         )
         self.fused_training_status = apply_roformer_fused_training_backend(
             self.model,
@@ -110,7 +153,9 @@ class SeparationLightningModule(pl.LightningModule):
         if self.fused_training_status.reason:
             self.config.training.fused_kernel_reason = self.fused_training_status.reason
         self.cuda_graph_mode = normalize_cuda_graph_mode(
-            cuda_graph_mode if cuda_graph_mode is not None else self.config.training.get("cuda_graph_mode")
+            cuda_graph_mode
+            if cuda_graph_mode is not None
+            else self.config.training.get("cuda_graph_mode", runtime_defaults.get("cuda_graph_mode"))
         )
         self.cuda_graph_status = CudaGraphRuntimeStatus(requested=self.cuda_graph_mode, active="off")
         self._cuda_graph_runner: RoformerMaskCoreCudaGraph | None = None
@@ -139,6 +184,7 @@ class SeparationLightningModule(pl.LightningModule):
                 "start_checkpoint": str(start_checkpoint) if start_checkpoint else None,
                 "strict_checkpoint": strict_checkpoint,
                 "optimizer_backend": self.optimizer_backend,
+                "runtime_optimization_preset": self.runtime_optimization_preset,
                 "cuda_attention_backend": self.cuda_attention_backend,
                 "fused_kernel_backend": self.fused_kernel_backend,
                 "fused_rms_norm_mode": self.fused_rms_norm_mode,
@@ -301,6 +347,32 @@ def _normalize_optimizer_backend(value: str) -> str:
     if backend in {"fused_capturable", "capturable_fused"}:
         return "fused_capturable"
     raise ValueError("optimizer_backend must be one of: default, foreach, fused, fused_capturable")
+
+
+def _normalize_runtime_optimization_preset(value: object) -> str:
+    preset = str(value or "off").strip().lower().replace("-", "_")
+    if preset in RUNTIME_OPTIMIZATION_PRESETS:
+        return preset
+    raise ValueError("runtime_optimization_preset must be one of: off, train_fragmentation, high_util")
+
+
+def _runtime_optimization_defaults(preset: str) -> dict[str, str]:
+    if preset == "train_fragmentation":
+        return dict(TRAIN_FRAGMENTATION_DEFAULTS)
+    if preset == "high_util":
+        return dict(HIGH_UTIL_DEFAULTS)
+    return {}
+
+
+def _apply_runtime_optimization_environment(preset: str) -> None:
+    if preset == "train_fragmentation":
+        env = TRAIN_FRAGMENTATION_ENV
+    elif preset == "high_util":
+        env = HIGH_UTIL_ENV
+    else:
+        return
+    for key, value in env.items():
+        os.environ[key] = value
 
 
 def _optimizer_backend_kwargs(backend: str) -> dict[str, bool]:

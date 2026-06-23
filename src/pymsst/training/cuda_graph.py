@@ -57,6 +57,7 @@ class RoformerTrainingCudaGraph:
                 with _cuda_autocast(use_amp):
                     _, context = common.stft_roformer(self.model, sample_mixture)
                     graph_module = _STFTMaskCoreModule(self.model)
+                    graph_module(sample_mixture)
                     self._graph_call = torch.cuda.make_graphed_callables(graph_module, (sample_mixture,))
             else:
                 with _cuda_autocast(use_amp):
@@ -65,6 +66,7 @@ class RoformerTrainingCudaGraph:
                 graph_module = _MaskCoreModule(self.model, context)
 
                 with _cuda_autocast(use_amp):
+                    graph_module(sample_stft)
                     self._graph_call = torch.cuda.make_graphed_callables(graph_module, (sample_stft,))
             self._context = context
             self._input_shape = tuple(sample_mixture.shape)

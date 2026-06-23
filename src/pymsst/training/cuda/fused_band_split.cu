@@ -654,7 +654,9 @@ __global__ void band_split_ragged_forward_kernel(
 template <typename scalar_t>
 at::Tensor tensor_from_host_ptrs(const std::vector<const scalar_t*>& ptrs, const at::TensorOptions& options) {
   auto tensor = at::empty({static_cast<int64_t>(ptrs.size())}, options.dtype(at::kLong));
-  auto cpu = at::empty({static_cast<int64_t>(ptrs.size())}, at::TensorOptions().dtype(at::kLong));
+  auto cpu = at::empty(
+      {static_cast<int64_t>(ptrs.size())},
+      at::TensorOptions().dtype(at::kLong).device(at::kCPU).pinned_memory(true));
   auto* values = cpu.data_ptr<int64_t>();
   for (size_t index = 0; index < ptrs.size(); ++index) {
     values[index] = static_cast<int64_t>(reinterpret_cast<uintptr_t>(ptrs[index]));

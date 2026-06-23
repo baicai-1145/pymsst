@@ -13,7 +13,7 @@ from pymss_core import to_plain
 
 from pymsst import __version__
 from pymsst.data.datamodule import MusdbDataModule
-from pymsst.training.cuda_graph import RoformerMaskCoreCudaGraph, normalize_cuda_graph_mode
+from pymsst.training.cuda_graph import RoformerMaskCoreCudaGraph
 from pymsst.training import SeparationLightningModule, compute_loss
 
 
@@ -42,6 +42,7 @@ def run_direct_loss_curve(
     fused_kernel_backend: str | None = None,
     fused_rms_norm_mode: str | None = None,
     cuda_graph_mode: str | None = None,
+    runtime_optimization_preset: str | None = None,
 ) -> dict[str, object]:
     if implementation == "pymsst":
         return _run_pymsst_curve(
@@ -63,6 +64,7 @@ def run_direct_loss_curve(
             fused_kernel_backend=fused_kernel_backend,
             fused_rms_norm_mode=fused_rms_norm_mode,
             cuda_graph_mode=cuda_graph_mode,
+            runtime_optimization_preset=runtime_optimization_preset,
         )
     if implementation == "original":
         if optimizer_backend not in {None, "default"}:
@@ -75,6 +77,8 @@ def run_direct_loss_curve(
             raise ValueError("--fused-rms-norm-mode is only supported for --implementation pymsst")
         if cuda_graph_mode not in {None, "off"}:
             raise ValueError("--cuda-graph-mode is only supported for --implementation pymsst")
+        if runtime_optimization_preset not in {None, "off"}:
+            raise ValueError("--runtime-optimization-preset is only supported for --implementation pymsst")
         if num_workers or pin_memory or persistent_workers:
             raise ValueError("--num-workers/--pin-memory/--persistent-workers are only supported for --implementation pymsst")
         if loss_record_interval != 1:
@@ -114,6 +118,7 @@ def _run_pymsst_curve(
     fused_kernel_backend: str | None,
     fused_rms_norm_mode: str | None,
     cuda_graph_mode: str | None,
+    runtime_optimization_preset: str | None,
 ) -> dict[str, object]:
     _seed_everything(seed)
     results_path.mkdir(parents=True, exist_ok=True)
@@ -127,6 +132,8 @@ def _run_pymsst_curve(
         cuda_attention_backend=cuda_attention_backend,
         fused_kernel_backend=fused_kernel_backend,
         fused_rms_norm_mode=fused_rms_norm_mode,
+        cuda_graph_mode=cuda_graph_mode,
+        runtime_optimization_preset=runtime_optimization_preset,
     )
     _consume_original_roformer_python_rng(model_type)
     config = module.config
@@ -135,6 +142,7 @@ def _run_pymsst_curve(
     config.training.pin_memory = bool(pin_memory)
     config.training.persistent_workers = bool(persistent_workers)
     config.training.loss_record_interval = int(loss_record_interval)
+    config.training.runtime_optimization_preset = module.runtime_optimization_preset
     config.training.fused_kernel_backend = module.fused_kernel_backend
     config.training.fused_rms_norm_mode = module.fused_rms_norm_mode or "off"
     config.training.fused_kernel_active = module.fused_training_status.active
@@ -165,7 +173,7 @@ def _run_pymsst_curve(
     config.training.fused_kernel_mask_estimator_final_mode = module.fused_training_status.mask_estimator_final_mode
     if module.fused_training_status.reason:
         config.training.fused_kernel_reason = module.fused_training_status.reason
-    normalized_cuda_graph_mode = normalize_cuda_graph_mode(cuda_graph_mode)
+    normalized_cuda_graph_mode = module.cuda_graph_mode
     config.training.cuda_graph_mode = normalized_cuda_graph_mode
     batch_size = int(config.training.batch_size)
 
