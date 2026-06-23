@@ -1,10 +1,13 @@
 #include <ATen/ATen.h>
+#include <ATen/cuda/CUDABlas.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <cublas_v2.h>
 #include <torch/extension.h>
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <vector>
 
 template <typename scalar_t>
@@ -581,6 +584,420 @@ std::vector<at::Tensor> band_split_backward_v3_cuda(
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
   return {grad_x, grad_gamma, grad_weight, grad_bias};
+}
+
+template <typename scalar_t>
+__global__ void band_split_ragged_forward_kernel(
+    const scalar_t* __restrict__ x,
+    const scalar_t* const* __restrict__ gammas,
+    const scalar_t* const* __restrict__ weights,
+    const scalar_t* const* __restrict__ biases,
+    const int64_t* __restrict__ offsets,
+    scalar_t* __restrict__ out,
+    scalar_t* __restrict__ normed,
+    float* __restrict__ inv_norm,
+    int64_t m_count,
+    int64_t band_count,
+    int64_t out_features,
+    int64_t total_in) {
+  extern __shared__ float shared[];
+  const int64_t m = blockIdx.x;
+  const int64_t band = blockIdx.y;
+  const int tid = threadIdx.x;
+  const int64_t start = offsets[band];
+  const int64_t end = offsets[band + 1];
+  const int64_t in_features = end - start;
+
+  float sum_sq = 0.0f;
+  for (int64_t i = tid; i < in_features; i += blockDim.x) {
+    const float value = static_cast<float>(x[m * total_in + start + i]);
+    sum_sq += value * value;
+  }
+  shared[tid] = sum_sq;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      shared[tid] += shared[tid + stride];
+    }
+    __syncthreads();
+  }
+
+  const float scale = sqrtf(static_cast<float>(in_features));
+  const float norm = fmaxf(sqrtf(shared[0]), 1.0e-12f);
+  const float inv = 1.0f / norm;
+  if (tid == 0) {
+    inv_norm[m * band_count + band] = inv;
+  }
+
+  const scalar_t* gamma = gammas[band];
+  const scalar_t* weight = weights[band];
+  const scalar_t* bias = biases[band];
+
+  for (int64_t i = tid; i < in_features; i += blockDim.x) {
+    const float value = static_cast<float>(x[m * total_in + start + i]);
+    normed[m * total_in + start + i] = static_cast<scalar_t>(value * inv * scale);
+  }
+  __syncthreads();
+
+  for (int64_t o = tid; o < out_features; o += blockDim.x) {
+    float acc = static_cast<float>(bias[o]);
+    for (int64_t i = 0; i < in_features; ++i) {
+      const float value = static_cast<float>(x[m * total_in + start + i]);
+      const float feature = value * inv * scale * static_cast<float>(gamma[i]);
+      acc += feature * static_cast<float>(weight[o * in_features + i]);
+    }
+    out[(m * band_count + band) * out_features + o] = static_cast<scalar_t>(acc);
+  }
+}
+
+template <typename scalar_t>
+at::Tensor tensor_from_host_ptrs(const std::vector<const scalar_t*>& ptrs, const at::TensorOptions& options) {
+  auto tensor = at::empty({static_cast<int64_t>(ptrs.size())}, options.dtype(at::kLong));
+  auto cpu = at::empty({static_cast<int64_t>(ptrs.size())}, at::TensorOptions().dtype(at::kLong));
+  auto* values = cpu.data_ptr<int64_t>();
+  for (size_t index = 0; index < ptrs.size(); ++index) {
+    values[index] = static_cast<int64_t>(reinterpret_cast<uintptr_t>(ptrs[index]));
+  }
+  tensor.copy_(cpu, true);
+  return tensor;
+}
+
+at::Tensor contiguous_if_needed(const at::Tensor& tensor) {
+  return tensor.is_contiguous() ? tensor : tensor.contiguous();
+}
+
+std::vector<at::Tensor> band_split_ragged_forward_cuda(
+    const at::Tensor& x,
+    const std::vector<at::Tensor>& gammas,
+    const std::vector<at::Tensor>& weights,
+    const std::vector<at::Tensor>& biases,
+    const std::vector<int64_t>& dim_inputs,
+    const at::Tensor& dim_offsets) {
+  const c10::cuda::CUDAGuard device_guard(x.device());
+  auto x_contiguous = x.contiguous();
+
+  const auto m_count = x_contiguous.size(0);
+  const auto total_in = x_contiguous.size(1);
+  const auto band_count = static_cast<int64_t>(weights.size());
+  const auto out_features = weights[0].size(0);
+  auto out = at::empty({m_count, band_count, out_features}, x_contiguous.options());
+  auto normed = at::empty_like(x_contiguous);
+  auto inv_norm = at::empty({m_count, band_count}, x_contiguous.options().dtype(at::kFloat));
+
+  const int threads = 256;
+  const size_t shared_bytes = threads * sizeof(float);
+  const auto stream = at::cuda::getCurrentCUDAStream();
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::Half,
+      at::ScalarType::BFloat16,
+      x.scalar_type(),
+      "band_split_ragged_forward_cuda",
+      [&] {
+        std::vector<at::Tensor> gamma_contiguous;
+        std::vector<at::Tensor> weight_contiguous;
+        std::vector<at::Tensor> bias_contiguous;
+        std::vector<const scalar_t*> gamma_ptrs;
+        std::vector<const scalar_t*> weight_ptrs;
+        std::vector<const scalar_t*> bias_ptrs;
+        gamma_contiguous.reserve(gammas.size());
+        weight_contiguous.reserve(weights.size());
+        bias_contiguous.reserve(biases.size());
+        gamma_ptrs.reserve(gammas.size());
+        weight_ptrs.reserve(weights.size());
+        bias_ptrs.reserve(biases.size());
+        for (size_t index = 0; index < weights.size(); ++index) {
+          gamma_contiguous.push_back(contiguous_if_needed(gammas[index]));
+          weight_contiguous.push_back(contiguous_if_needed(weights[index]));
+          bias_contiguous.push_back(contiguous_if_needed(biases[index]));
+          gamma_ptrs.push_back(gamma_contiguous.back().data_ptr<scalar_t>());
+          weight_ptrs.push_back(weight_contiguous.back().data_ptr<scalar_t>());
+          bias_ptrs.push_back(bias_contiguous.back().data_ptr<scalar_t>());
+        }
+        auto gamma_ptr_tensor = tensor_from_host_ptrs(gamma_ptrs, x_contiguous.options());
+        auto weight_ptr_tensor = tensor_from_host_ptrs(weight_ptrs, x_contiguous.options());
+        auto bias_ptr_tensor = tensor_from_host_ptrs(bias_ptrs, x_contiguous.options());
+        band_split_ragged_forward_kernel<scalar_t><<<dim3(m_count, band_count), threads, shared_bytes, stream>>>(
+            x_contiguous.data_ptr<scalar_t>(),
+            reinterpret_cast<const scalar_t* const*>(gamma_ptr_tensor.data_ptr<int64_t>()),
+            reinterpret_cast<const scalar_t* const*>(weight_ptr_tensor.data_ptr<int64_t>()),
+            reinterpret_cast<const scalar_t* const*>(bias_ptr_tensor.data_ptr<int64_t>()),
+            dim_offsets.data_ptr<int64_t>(),
+            out.data_ptr<scalar_t>(),
+            normed.data_ptr<scalar_t>(),
+            inv_norm.data_ptr<float>(),
+            m_count,
+            band_count,
+            out_features,
+            total_in);
+      });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {out, normed, inv_norm};
+}
+
+template <typename scalar_t>
+__global__ void band_split_ragged_backward_input_kernel(
+    const scalar_t* __restrict__ grad_out,
+    const scalar_t* __restrict__ normed,
+    const float* __restrict__ inv_norm,
+    const scalar_t* const* __restrict__ gammas,
+    const scalar_t* const* __restrict__ weights,
+    const int64_t* __restrict__ offsets,
+    scalar_t* __restrict__ grad_x,
+    float* __restrict__ grad_scaled_cache,
+    int64_t m_count,
+    int64_t band_count,
+    int64_t out_features,
+    int64_t total_in) {
+  extern __shared__ float shared[];
+  const int64_t m = blockIdx.x;
+  const int64_t band = blockIdx.y;
+  const int tid = threadIdx.x;
+  const int64_t start = offsets[band];
+  const int64_t end = offsets[band + 1];
+  const int64_t in_features = end - start;
+  const float scale = sqrtf(static_cast<float>(in_features));
+  const float inv = inv_norm[m * band_count + band];
+  const scalar_t* gamma = gammas[band];
+  const scalar_t* weight = weights[band];
+
+  float dot_partial = 0.0f;
+  for (int64_t i = tid; i < in_features; i += blockDim.x) {
+    float grad_scaled = 0.0f;
+    for (int64_t o = 0; o < out_features; ++o) {
+      grad_scaled += static_cast<float>(grad_out[(m * band_count + band) * out_features + o]) *
+                     static_cast<float>(weight[o * in_features + i]);
+    }
+    const float grad_normed = grad_scaled * static_cast<float>(gamma[i]);
+    grad_scaled_cache[m * total_in + start + i] = grad_scaled;
+    dot_partial += grad_normed * static_cast<float>(normed[m * total_in + start + i]);
+  }
+
+  shared[tid] = dot_partial;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      shared[tid] += shared[tid + stride];
+    }
+    __syncthreads();
+  }
+  const float dot = shared[0];
+
+  for (int64_t i = tid; i < in_features; i += blockDim.x) {
+    float grad_scaled = 0.0f;
+    for (int64_t o = 0; o < out_features; ++o) {
+      grad_scaled += static_cast<float>(grad_out[(m * band_count + band) * out_features + o]) *
+                     static_cast<float>(weight[o * in_features + i]);
+    }
+    const float grad_normed = grad_scaled * static_cast<float>(gamma[i]);
+    const float normed_value = static_cast<float>(normed[m * total_in + start + i]);
+    const float value = inv * (grad_normed * scale - normed_value * (dot / scale));
+    grad_x[m * total_in + start + i] = static_cast<scalar_t>(value);
+  }
+}
+
+template <typename scalar_t>
+__global__ void band_split_ragged_backward_weight_bias_kernel(
+    const scalar_t* __restrict__ grad_out,
+    const scalar_t* __restrict__ normed,
+    const scalar_t* const* __restrict__ gammas,
+    scalar_t* const* __restrict__ grad_weights,
+    scalar_t* const* __restrict__ grad_biases,
+    const int64_t* __restrict__ offsets,
+    int64_t m_count,
+    int64_t band_count,
+    int64_t out_features,
+    int64_t total_in) {
+  const int64_t band = blockIdx.x;
+  const int64_t o = blockIdx.y;
+  const int tid = threadIdx.x;
+  const int64_t start = offsets[band];
+  const int64_t end = offsets[band + 1];
+  const int64_t in_features = end - start;
+  const scalar_t* gamma = gammas[band];
+  scalar_t* grad_weight = grad_weights[band];
+  scalar_t* grad_bias = grad_biases[band];
+
+  if (tid == 0) {
+    float bias_acc = 0.0f;
+    for (int64_t m = 0; m < m_count; ++m) {
+      bias_acc += static_cast<float>(grad_out[(m * band_count + band) * out_features + o]);
+    }
+    grad_bias[o] = static_cast<scalar_t>(bias_acc);
+  }
+
+  for (int64_t i = tid; i < in_features; i += blockDim.x) {
+    float weight_acc = 0.0f;
+    const float gamma_value = static_cast<float>(gamma[i]);
+    for (int64_t m = 0; m < m_count; ++m) {
+      weight_acc += static_cast<float>(grad_out[(m * band_count + band) * out_features + o]) *
+                    static_cast<float>(normed[m * total_in + start + i]) * gamma_value;
+    }
+    grad_weight[o * in_features + i] = static_cast<scalar_t>(weight_acc);
+  }
+}
+
+template <typename scalar_t>
+__global__ void band_split_ragged_backward_gamma_from_scaled_kernel(
+    const float* __restrict__ grad_scaled_cache,
+    const scalar_t* __restrict__ normed,
+    scalar_t* const* __restrict__ grad_gammas,
+    const int64_t* __restrict__ offsets,
+    int64_t m_count,
+    int64_t max_in_features,
+    int64_t total_in) {
+  const int64_t band = blockIdx.x;
+  const int64_t i = blockIdx.y;
+  const int tid = threadIdx.x;
+  const int64_t start = offsets[band];
+  const int64_t end = offsets[band + 1];
+  const int64_t in_features = end - start;
+  if (i >= in_features || i >= max_in_features) {
+    return;
+  }
+
+  float acc = 0.0f;
+  for (int64_t m = tid; m < m_count; m += blockDim.x) {
+    acc += grad_scaled_cache[m * total_in + start + i] * static_cast<float>(normed[m * total_in + start + i]);
+  }
+
+  extern __shared__ float shared[];
+  shared[tid] = acc;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      shared[tid] += shared[tid + stride];
+    }
+    __syncthreads();
+  }
+  if (tid == 0) {
+    grad_gammas[band][i] = static_cast<scalar_t>(shared[0]);
+  }
+}
+
+std::vector<at::Tensor> band_split_ragged_backward_cuda(
+    const at::Tensor& grad_out,
+    const at::Tensor& normed,
+    const at::Tensor& inv_norm,
+    const std::vector<at::Tensor>& gammas,
+    const std::vector<at::Tensor>& weights,
+    const std::vector<int64_t>& dim_inputs,
+    const at::Tensor& dim_offsets) {
+  const c10::cuda::CUDAGuard device_guard(grad_out.device());
+  auto grad_out_contiguous = grad_out.contiguous();
+  auto normed_contiguous = normed.contiguous();
+
+  const auto m_count = grad_out_contiguous.size(0);
+  const auto band_count = grad_out_contiguous.size(1);
+  const auto out_features = grad_out_contiguous.size(2);
+  const auto total_in = normed_contiguous.size(1);
+
+  auto grad_x = at::empty_like(normed_contiguous);
+  auto grad_scaled_cache = at::empty({m_count, total_in}, grad_out_contiguous.options().dtype(at::kFloat));
+  std::vector<at::Tensor> grad_gammas;
+  std::vector<at::Tensor> grad_weights;
+  std::vector<at::Tensor> grad_biases;
+  grad_gammas.reserve(gammas.size());
+  grad_weights.reserve(weights.size());
+  grad_biases.reserve(weights.size());
+  for (size_t index = 0; index < weights.size(); ++index) {
+    grad_gammas.push_back(at::empty_like(gammas[index]));
+    grad_weights.push_back(at::empty_like(weights[index]));
+    grad_biases.push_back(at::empty({out_features}, grad_out_contiguous.options()));
+  }
+
+  const int threads = 256;
+  const size_t shared_bytes = threads * sizeof(float);
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const auto max_in_features = *std::max_element(dim_inputs.begin(), dim_inputs.end());
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::Half,
+      at::ScalarType::BFloat16,
+      grad_out.scalar_type(),
+      "band_split_ragged_backward_cuda",
+      [&] {
+        std::vector<at::Tensor> gamma_contiguous;
+        std::vector<at::Tensor> weight_contiguous;
+        std::vector<const scalar_t*> gamma_ptrs;
+        std::vector<const scalar_t*> weight_ptrs;
+        std::vector<const scalar_t*> grad_gamma_ptrs;
+        std::vector<const scalar_t*> grad_weight_ptrs;
+        std::vector<const scalar_t*> grad_bias_ptrs;
+        gamma_contiguous.reserve(gammas.size());
+        weight_contiguous.reserve(weights.size());
+        gamma_ptrs.reserve(gammas.size());
+        weight_ptrs.reserve(weights.size());
+        grad_gamma_ptrs.reserve(gammas.size());
+        grad_weight_ptrs.reserve(weights.size());
+        grad_bias_ptrs.reserve(weights.size());
+        for (size_t index = 0; index < weights.size(); ++index) {
+          gamma_contiguous.push_back(contiguous_if_needed(gammas[index]));
+          weight_contiguous.push_back(contiguous_if_needed(weights[index]));
+          gamma_ptrs.push_back(gamma_contiguous.back().data_ptr<scalar_t>());
+          weight_ptrs.push_back(weight_contiguous.back().data_ptr<scalar_t>());
+          grad_gamma_ptrs.push_back(grad_gammas[index].data_ptr<scalar_t>());
+          grad_weight_ptrs.push_back(grad_weights[index].data_ptr<scalar_t>());
+          grad_bias_ptrs.push_back(grad_biases[index].data_ptr<scalar_t>());
+        }
+        auto gamma_ptr_tensor = tensor_from_host_ptrs(gamma_ptrs, grad_out_contiguous.options());
+        auto weight_ptr_tensor = tensor_from_host_ptrs(weight_ptrs, grad_out_contiguous.options());
+        auto grad_gamma_ptr_tensor = tensor_from_host_ptrs(grad_gamma_ptrs, grad_out_contiguous.options());
+        auto grad_weight_ptr_tensor = tensor_from_host_ptrs(grad_weight_ptrs, grad_out_contiguous.options());
+        auto grad_bias_ptr_tensor = tensor_from_host_ptrs(grad_bias_ptrs, grad_out_contiguous.options());
+
+        band_split_ragged_backward_input_kernel<scalar_t>
+            <<<dim3(m_count, band_count), threads, shared_bytes, stream>>>(
+                grad_out_contiguous.data_ptr<scalar_t>(),
+                normed_contiguous.data_ptr<scalar_t>(),
+                inv_norm.data_ptr<float>(),
+                reinterpret_cast<const scalar_t* const*>(gamma_ptr_tensor.data_ptr<int64_t>()),
+                reinterpret_cast<const scalar_t* const*>(weight_ptr_tensor.data_ptr<int64_t>()),
+                dim_offsets.data_ptr<int64_t>(),
+                grad_x.data_ptr<scalar_t>(),
+                grad_scaled_cache.data_ptr<float>(),
+                m_count,
+                band_count,
+                out_features,
+                total_in);
+        band_split_ragged_backward_weight_bias_kernel<scalar_t>
+            <<<dim3(band_count, out_features), threads, 0, stream>>>(
+                grad_out_contiguous.data_ptr<scalar_t>(),
+                normed_contiguous.data_ptr<scalar_t>(),
+                reinterpret_cast<const scalar_t* const*>(gamma_ptr_tensor.data_ptr<int64_t>()),
+                reinterpret_cast<scalar_t* const*>(grad_weight_ptr_tensor.data_ptr<int64_t>()),
+                reinterpret_cast<scalar_t* const*>(grad_bias_ptr_tensor.data_ptr<int64_t>()),
+                dim_offsets.data_ptr<int64_t>(),
+                m_count,
+                band_count,
+                out_features,
+                total_in);
+        band_split_ragged_backward_gamma_from_scaled_kernel<scalar_t>
+            <<<dim3(band_count, max_in_features), threads, shared_bytes, stream>>>(
+                grad_scaled_cache.data_ptr<float>(),
+                normed_contiguous.data_ptr<scalar_t>(),
+                reinterpret_cast<scalar_t* const*>(grad_gamma_ptr_tensor.data_ptr<int64_t>()),
+                dim_offsets.data_ptr<int64_t>(),
+                m_count,
+                max_in_features,
+                total_in);
+      });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  std::vector<at::Tensor> result;
+  result.reserve(1 + grad_gammas.size() + grad_weights.size() + grad_biases.size());
+  result.push_back(grad_x);
+  for (auto& grad_gamma : grad_gammas) {
+    result.push_back(grad_gamma);
+  }
+  for (auto& grad_weight : grad_weights) {
+    result.push_back(grad_weight);
+  }
+  for (auto& grad_bias : grad_biases) {
+    result.push_back(grad_bias);
+  }
+  return result;
 }
 
 template <typename scalar_t>
@@ -1614,4 +2031,819 @@ std::vector<at::Tensor> attention_gate_backward_cuda(
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
   return {grad_attn, grad_x, grad_weight, grad_bias};
+}
+
+cudaDataType_t cuda_data_type_for(at::ScalarType dtype) {
+  switch (dtype) {
+    case at::kHalf:
+      return CUDA_R_16F;
+    case at::kBFloat16:
+      return CUDA_R_16BF;
+    case at::kFloat:
+      return CUDA_R_32F;
+    default:
+      TORCH_CHECK(false, "unsupported dtype for grouped GEMM");
+  }
+}
+
+cublasComputeType_t cublas_compute_type_for(at::ScalarType dtype) {
+  switch (dtype) {
+    case at::kHalf:
+      return CUBLAS_COMPUTE_32F_FAST_16F;
+    case at::kBFloat16:
+      return CUBLAS_COMPUTE_32F_FAST_16BF;
+    case at::kFloat:
+      return CUBLAS_COMPUTE_32F;
+    default:
+      TORCH_CHECK(false, "unsupported dtype for grouped GEMM");
+  }
+}
+
+void check_cublas_status(cublasStatus_t status, const char* name) {
+  TORCH_CHECK(status == CUBLAS_STATUS_SUCCESS, name, " failed with cublas status ", static_cast<int>(status));
+}
+
+std::vector<int64_t> dim_offsets_from_inputs(const std::vector<int64_t>& dim_inputs) {
+  std::vector<int64_t> offsets;
+  offsets.reserve(dim_inputs.size() + 1);
+  offsets.push_back(0);
+  for (const auto dim : dim_inputs) {
+    TORCH_CHECK(dim > 0, "dim_inputs must be positive");
+    offsets.push_back(offsets.back() + dim);
+  }
+  return offsets;
+}
+
+struct GroupedGemmPlan {
+  std::vector<int> m_array;
+  std::vector<int> n_array;
+  std::vector<int> k_array;
+  std::vector<int> lda_array;
+  std::vector<int> ldb_array;
+  std::vector<int> ldc_array;
+  std::vector<int> group_size;
+  std::vector<const void*> a_array;
+  std::vector<const void*> b_array;
+  std::vector<void*> c_array;
+  std::vector<cublasOperation_t> transa_array;
+  std::vector<cublasOperation_t> transb_array;
+};
+
+int find_or_add_group(std::vector<int>& group_keys, int key) {
+  for (size_t index = 0; index < group_keys.size(); ++index) {
+    if (group_keys[index] == key) {
+      return static_cast<int>(index);
+    }
+  }
+  group_keys.push_back(key);
+  return static_cast<int>(group_keys.size() - 1);
+}
+
+template <typename scalar_t>
+GroupedGemmPlan make_mask_forward_plan(
+    const scalar_t* x,
+    const std::vector<at::Tensor>& weights,
+    scalar_t* pre,
+    const std::vector<int64_t>& dim_inputs,
+    const std::vector<int64_t>& offsets,
+    int64_t m_count,
+    int64_t band_count,
+    int64_t hidden,
+    int64_t total_pre) {
+  std::vector<int> group_keys;
+  std::vector<std::vector<int64_t>> grouped_bands;
+  for (int64_t band = 0; band < band_count; ++band) {
+    const int pre_out = static_cast<int>(dim_inputs[band] * 2);
+    const int group = find_or_add_group(group_keys, pre_out);
+    if (group == static_cast<int>(grouped_bands.size())) {
+      grouped_bands.emplace_back();
+    }
+    grouped_bands[group].push_back(band);
+  }
+
+  GroupedGemmPlan plan;
+  const int group_count = static_cast<int>(group_keys.size());
+  plan.m_array.reserve(group_count);
+  plan.n_array.reserve(group_count);
+  plan.k_array.reserve(group_count);
+  plan.lda_array.reserve(group_count);
+  plan.ldb_array.reserve(group_count);
+  plan.ldc_array.reserve(group_count);
+  plan.group_size.reserve(group_count);
+  plan.transa_array.reserve(group_count);
+  plan.transb_array.reserve(group_count);
+
+  for (int group = 0; group < group_count; ++group) {
+    const int pre_out = group_keys[group];
+    plan.transa_array.push_back(CUBLAS_OP_T);
+    plan.transb_array.push_back(CUBLAS_OP_N);
+    plan.m_array.push_back(pre_out);
+    plan.n_array.push_back(static_cast<int>(m_count));
+    plan.k_array.push_back(static_cast<int>(hidden));
+    plan.lda_array.push_back(static_cast<int>(hidden));
+    plan.ldb_array.push_back(static_cast<int>(band_count * hidden));
+    plan.ldc_array.push_back(static_cast<int>(total_pre));
+    plan.group_size.push_back(static_cast<int>(grouped_bands[group].size()));
+    for (const auto band : grouped_bands[group]) {
+      plan.a_array.push_back(weights[band].data_ptr<scalar_t>());
+      plan.b_array.push_back(x + band * hidden);
+      plan.c_array.push_back(pre + offsets[band] * 2);
+    }
+  }
+  return plan;
+}
+
+template <typename scalar_t>
+GroupedGemmPlan make_mask_grad_x_plan(
+    const scalar_t* grad_pre,
+    const std::vector<at::Tensor>& weights,
+    scalar_t* grad_x,
+    const std::vector<int64_t>& dim_inputs,
+    const std::vector<int64_t>& offsets,
+    int64_t m_count,
+    int64_t band_count,
+    int64_t hidden,
+    int64_t total_pre) {
+  std::vector<int> group_keys;
+  std::vector<std::vector<int64_t>> grouped_bands;
+  for (int64_t band = 0; band < band_count; ++band) {
+    const int pre_out = static_cast<int>(dim_inputs[band] * 2);
+    const int group = find_or_add_group(group_keys, pre_out);
+    if (group == static_cast<int>(grouped_bands.size())) {
+      grouped_bands.emplace_back();
+    }
+    grouped_bands[group].push_back(band);
+  }
+
+  GroupedGemmPlan plan;
+  const int group_count = static_cast<int>(group_keys.size());
+  for (int group = 0; group < group_count; ++group) {
+    const int pre_out = group_keys[group];
+    plan.transa_array.push_back(CUBLAS_OP_N);
+    plan.transb_array.push_back(CUBLAS_OP_N);
+    plan.m_array.push_back(static_cast<int>(hidden));
+    plan.n_array.push_back(static_cast<int>(m_count));
+    plan.k_array.push_back(pre_out);
+    plan.lda_array.push_back(static_cast<int>(hidden));
+    plan.ldb_array.push_back(static_cast<int>(total_pre));
+    plan.ldc_array.push_back(static_cast<int>(band_count * hidden));
+    plan.group_size.push_back(static_cast<int>(grouped_bands[group].size()));
+    for (const auto band : grouped_bands[group]) {
+      plan.a_array.push_back(weights[band].data_ptr<scalar_t>());
+      plan.b_array.push_back(grad_pre + offsets[band] * 2);
+      plan.c_array.push_back(grad_x + band * hidden);
+    }
+  }
+  return plan;
+}
+
+template <typename scalar_t>
+GroupedGemmPlan make_mask_grad_weight_plan(
+    const scalar_t* x,
+    const scalar_t* grad_pre,
+    const std::vector<at::Tensor>& grad_weights,
+    const std::vector<int64_t>& dim_inputs,
+    const std::vector<int64_t>& offsets,
+    int64_t m_count,
+    int64_t band_count,
+    int64_t hidden,
+    int64_t total_pre) {
+  std::vector<int> group_keys;
+  std::vector<std::vector<int64_t>> grouped_bands;
+  for (int64_t band = 0; band < band_count; ++band) {
+    const int pre_out = static_cast<int>(dim_inputs[band] * 2);
+    const int group = find_or_add_group(group_keys, pre_out);
+    if (group == static_cast<int>(grouped_bands.size())) {
+      grouped_bands.emplace_back();
+    }
+    grouped_bands[group].push_back(band);
+  }
+
+  GroupedGemmPlan plan;
+  const int group_count = static_cast<int>(group_keys.size());
+  for (int group = 0; group < group_count; ++group) {
+    const int pre_out = group_keys[group];
+    plan.transa_array.push_back(CUBLAS_OP_N);
+    plan.transb_array.push_back(CUBLAS_OP_T);
+    plan.m_array.push_back(static_cast<int>(hidden));
+    plan.n_array.push_back(pre_out);
+    plan.k_array.push_back(static_cast<int>(m_count));
+    plan.lda_array.push_back(static_cast<int>(band_count * hidden));
+    plan.ldb_array.push_back(static_cast<int>(total_pre));
+    plan.ldc_array.push_back(static_cast<int>(hidden));
+    plan.group_size.push_back(static_cast<int>(grouped_bands[group].size()));
+    for (const auto band : grouped_bands[group]) {
+      plan.a_array.push_back(x + band * hidden);
+      plan.b_array.push_back(grad_pre + offsets[band] * 2);
+      plan.c_array.push_back(grad_weights[band].data_ptr<scalar_t>());
+    }
+  }
+  return plan;
+}
+
+void run_grouped_gemm(
+    const GroupedGemmPlan& plan,
+    cudaDataType_t data_type,
+    cublasComputeType_t compute_type,
+    const char* name) {
+  if (plan.group_size.empty()) {
+    return;
+  }
+  std::vector<float> alpha(plan.group_size.size(), 1.0f);
+  std::vector<float> beta(plan.group_size.size(), 0.0f);
+  cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
+  auto stream = at::cuda::getCurrentCUDAStream();
+  check_cublas_status(cublasSetStream(handle, stream), "cublasSetStream");
+  const auto status = cublasGemmGroupedBatchedEx(
+      handle,
+      plan.transa_array.data(),
+      plan.transb_array.data(),
+      plan.m_array.data(),
+      plan.n_array.data(),
+      plan.k_array.data(),
+      alpha.data(),
+      plan.a_array.data(),
+      data_type,
+      plan.lda_array.data(),
+      plan.b_array.data(),
+      data_type,
+      plan.ldb_array.data(),
+      beta.data(),
+      plan.c_array.data(),
+      data_type,
+      plan.ldc_array.data(),
+      static_cast<int>(plan.group_size.size()),
+      plan.group_size.data(),
+      compute_type);
+  check_cublas_status(status, name);
+}
+
+template <typename scalar_t>
+__global__ void mask_estimator_final_glu_forward_kernel(
+    scalar_t* __restrict__ pre,
+    const scalar_t* __restrict__ bias,
+    scalar_t* __restrict__ out,
+    const int64_t* __restrict__ offsets,
+    int64_t m_count,
+    int64_t band_count,
+    int64_t total,
+    int64_t total_pre) {
+  const int64_t m = blockIdx.x;
+  const int64_t band = blockIdx.y;
+  const int tid = threadIdx.x;
+  const int64_t start = offsets[band];
+  const int64_t end = offsets[band + 1];
+  const int64_t dim = end - start;
+  const int64_t pre_start = start * 2;
+  for (int64_t local = tid; local < dim; local += blockDim.x) {
+    const int64_t pre_left = m * total_pre + pre_start + local;
+    const int64_t pre_gate = m * total_pre + pre_start + dim + local;
+    const float left = static_cast<float>(pre[pre_left]) + static_cast<float>(bias[pre_start + local]);
+    const float gate_pre = static_cast<float>(pre[pre_gate]) + static_cast<float>(bias[pre_start + dim + local]);
+    const float gate = 1.0f / (1.0f + expf(-gate_pre));
+    pre[pre_left] = static_cast<scalar_t>(left);
+    pre[pre_gate] = static_cast<scalar_t>(gate_pre);
+    out[m * total + start + local] = static_cast<scalar_t>(left * gate);
+  }
+}
+
+template <typename scalar_t>
+__global__ void mask_estimator_final_glu_backward_kernel(
+    const scalar_t* __restrict__ grad_out,
+    const scalar_t* __restrict__ pre,
+    scalar_t* __restrict__ grad_pre,
+    scalar_t* __restrict__ grad_bias,
+    const int64_t* __restrict__ offsets,
+    int64_t m_count,
+    int64_t band_count,
+    int64_t total,
+    int64_t total_pre) {
+  const int64_t band = blockIdx.x;
+  const int64_t local = blockIdx.y;
+  const int tid = threadIdx.x;
+  const int64_t start = offsets[band];
+  const int64_t end = offsets[band + 1];
+  const int64_t dim = end - start;
+  if (local >= dim) {
+    return;
+  }
+  const int64_t pre_left_offset = start * 2 + local;
+  const int64_t pre_gate_offset = start * 2 + dim + local;
+
+  float bias_left = 0.0f;
+  float bias_gate = 0.0f;
+  for (int64_t m = tid; m < m_count; m += blockDim.x) {
+    const float left = static_cast<float>(pre[m * total_pre + pre_left_offset]);
+    const float gate_pre = static_cast<float>(pre[m * total_pre + pre_gate_offset]);
+    const float gate = 1.0f / (1.0f + expf(-gate_pre));
+    const float grad = static_cast<float>(grad_out[m * total + start + local]);
+    const float grad_left = grad * gate;
+    const float grad_gate = grad * left * gate * (1.0f - gate);
+    grad_pre[m * total_pre + pre_left_offset] = static_cast<scalar_t>(grad_left);
+    grad_pre[m * total_pre + pre_gate_offset] = static_cast<scalar_t>(grad_gate);
+    bias_left += grad_left;
+    bias_gate += grad_gate;
+  }
+
+  extern __shared__ float shared[];
+  float* shared_left = shared;
+  float* shared_gate = shared + blockDim.x;
+  shared_left[tid] = bias_left;
+  shared_gate[tid] = bias_gate;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      shared_left[tid] += shared_left[tid + stride];
+      shared_gate[tid] += shared_gate[tid + stride];
+    }
+    __syncthreads();
+  }
+  if (tid == 0) {
+    grad_bias[pre_left_offset] = static_cast<scalar_t>(shared_left[0]);
+    grad_bias[pre_gate_offset] = static_cast<scalar_t>(shared_gate[0]);
+  }
+}
+
+std::vector<at::Tensor> mask_estimator_final_forward_cuda(
+    const at::Tensor& x,
+    const std::vector<at::Tensor>& weights,
+    const at::Tensor& bias,
+    const std::vector<int64_t>& dim_inputs,
+    const at::Tensor& dim_offsets) {
+  const c10::cuda::CUDAGuard device_guard(x.device());
+  auto x_contiguous = x.contiguous();
+  auto bias_contiguous = bias.contiguous();
+
+  const auto m_count = x_contiguous.size(0);
+  const auto band_count = x_contiguous.size(1);
+  const auto hidden = x_contiguous.size(2);
+  const auto offsets = dim_offsets_from_inputs(dim_inputs);
+  const auto total = offsets.back();
+  const auto total_pre = total * 2;
+
+  auto pre = at::empty({m_count, total_pre}, x_contiguous.options());
+  auto out = at::empty({m_count, total}, x_contiguous.options());
+
+  const auto data_type = cuda_data_type_for(x.scalar_type());
+  const auto compute_type = cublas_compute_type_for(x.scalar_type());
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::Half,
+      at::ScalarType::BFloat16,
+      x.scalar_type(),
+      "mask_estimator_final_forward_cuda",
+      [&] {
+        auto plan = make_mask_forward_plan<scalar_t>(
+            x_contiguous.data_ptr<scalar_t>(),
+            weights,
+            pre.data_ptr<scalar_t>(),
+            dim_inputs,
+            offsets,
+            m_count,
+            band_count,
+            hidden,
+            total_pre);
+        run_grouped_gemm(plan, data_type, compute_type, "mask_estimator_final_forward_grouped_gemm");
+
+        const int threads = 256;
+        const auto stream = at::cuda::getCurrentCUDAStream();
+        mask_estimator_final_glu_forward_kernel<scalar_t><<<dim3(m_count, band_count), threads, 0, stream>>>(
+            pre.data_ptr<scalar_t>(),
+            bias_contiguous.data_ptr<scalar_t>(),
+            out.data_ptr<scalar_t>(),
+            dim_offsets.data_ptr<int64_t>(),
+            m_count,
+            band_count,
+            total,
+            total_pre);
+      });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {out, pre, x_contiguous};
+}
+
+std::vector<at::Tensor> mask_estimator_final_backward_cuda(
+    const at::Tensor& grad_out,
+    const at::Tensor& x,
+    const at::Tensor& pre,
+    const std::vector<at::Tensor>& weights,
+    const std::vector<int64_t>& dim_inputs,
+    const at::Tensor& dim_offsets) {
+  const c10::cuda::CUDAGuard device_guard(grad_out.device());
+  auto grad_out_contiguous = grad_out.contiguous();
+  auto x_contiguous = x.contiguous();
+  auto pre_contiguous = pre.contiguous();
+
+  const auto m_count = x_contiguous.size(0);
+  const auto band_count = x_contiguous.size(1);
+  const auto hidden = x_contiguous.size(2);
+  const auto offsets = dim_offsets_from_inputs(dim_inputs);
+  const auto total = offsets.back();
+  const auto total_pre = total * 2;
+
+  auto grad_pre = at::empty({m_count, total_pre}, grad_out_contiguous.options());
+  auto grad_bias = at::empty({total_pre}, grad_out_contiguous.options());
+  auto grad_x = at::empty_like(x_contiguous);
+  std::vector<at::Tensor> grad_weights;
+  grad_weights.reserve(weights.size());
+  for (const auto& weight : weights) {
+    grad_weights.push_back(at::empty_like(weight));
+  }
+
+  const auto data_type = cuda_data_type_for(grad_out.scalar_type());
+  const auto compute_type = cublas_compute_type_for(grad_out.scalar_type());
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::Half,
+      at::ScalarType::BFloat16,
+      grad_out.scalar_type(),
+      "mask_estimator_final_backward_cuda",
+      [&] {
+        const int threads = 256;
+        const size_t shared_bytes = threads * sizeof(float) * 2;
+        const auto stream = at::cuda::getCurrentCUDAStream();
+        const int64_t max_dim = *std::max_element(dim_inputs.begin(), dim_inputs.end());
+        mask_estimator_final_glu_backward_kernel<scalar_t><<<dim3(band_count, max_dim), threads, shared_bytes, stream>>>(
+            grad_out_contiguous.data_ptr<scalar_t>(),
+            pre_contiguous.data_ptr<scalar_t>(),
+            grad_pre.data_ptr<scalar_t>(),
+            grad_bias.data_ptr<scalar_t>(),
+            dim_offsets.data_ptr<int64_t>(),
+            m_count,
+            band_count,
+            total,
+            total_pre);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+        auto grad_x_plan = make_mask_grad_x_plan<scalar_t>(
+            grad_pre.data_ptr<scalar_t>(),
+            weights,
+            grad_x.data_ptr<scalar_t>(),
+            dim_inputs,
+            offsets,
+            m_count,
+            band_count,
+            hidden,
+            total_pre);
+        run_grouped_gemm(grad_x_plan, data_type, compute_type, "mask_estimator_final_grad_x_grouped_gemm");
+
+        auto grad_weight_plan = make_mask_grad_weight_plan<scalar_t>(
+            x_contiguous.data_ptr<scalar_t>(),
+            grad_pre.data_ptr<scalar_t>(),
+            grad_weights,
+            dim_inputs,
+            offsets,
+            m_count,
+            band_count,
+            hidden,
+            total_pre);
+        run_grouped_gemm(grad_weight_plan, data_type, compute_type, "mask_estimator_final_grad_weight_grouped_gemm");
+      });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  std::vector<at::Tensor> result;
+  result.reserve(2 + grad_weights.size());
+  result.push_back(grad_x);
+  result.push_back(grad_bias);
+  for (auto& grad_weight : grad_weights) {
+    result.push_back(grad_weight);
+  }
+  return result;
+}
+
+template <typename scalar_t>
+__global__ void mask_estimator_final_direct_forward_kernel(
+    const scalar_t* __restrict__ x,
+    const scalar_t* const* __restrict__ weights,
+    const scalar_t* __restrict__ bias,
+    scalar_t* __restrict__ pre,
+    scalar_t* __restrict__ out,
+    const int64_t* __restrict__ offsets,
+    int64_t m_count,
+    int64_t band_count,
+    int64_t hidden,
+    int64_t total,
+    int64_t total_pre) {
+  const int64_t m = blockIdx.x;
+  const int64_t band = blockIdx.y;
+  const int tid = threadIdx.x;
+  const int64_t start = offsets[band];
+  const int64_t end = offsets[band + 1];
+  const int64_t dim = end - start;
+  const int64_t pre_start = start * 2;
+  const scalar_t* weight = weights[band];
+
+  for (int64_t local = tid; local < dim; local += blockDim.x) {
+    float left = static_cast<float>(bias[pre_start + local]);
+    float gate_pre = static_cast<float>(bias[pre_start + dim + local]);
+    for (int64_t h = 0; h < hidden; ++h) {
+      const float x_value = static_cast<float>(x[(m * band_count + band) * hidden + h]);
+      left += x_value * static_cast<float>(weight[local * hidden + h]);
+      gate_pre += x_value * static_cast<float>(weight[(dim + local) * hidden + h]);
+    }
+    const int64_t pre_left = m * total_pre + pre_start + local;
+    const int64_t pre_gate = m * total_pre + pre_start + dim + local;
+    const float gate = 1.0f / (1.0f + expf(-gate_pre));
+    pre[pre_left] = static_cast<scalar_t>(left);
+    pre[pre_gate] = static_cast<scalar_t>(gate_pre);
+    out[m * total + start + local] = static_cast<scalar_t>(left * gate);
+  }
+}
+
+template <typename scalar_t>
+__global__ void mask_estimator_final_direct_grad_x_kernel(
+    const scalar_t* __restrict__ grad_pre,
+    const scalar_t* const* __restrict__ weights,
+    scalar_t* __restrict__ grad_x,
+    const int64_t* __restrict__ offsets,
+    int64_t m_count,
+    int64_t band_count,
+    int64_t hidden,
+    int64_t total_pre) {
+  const int64_t m = blockIdx.x;
+  const int64_t band = blockIdx.y;
+  const int tid = threadIdx.x;
+  const int64_t start = offsets[band];
+  const int64_t end = offsets[band + 1];
+  const int64_t dim = end - start;
+  const int64_t pre_start = start * 2;
+  const scalar_t* weight = weights[band];
+
+  for (int64_t h = tid; h < hidden; h += blockDim.x) {
+    float acc = 0.0f;
+    for (int64_t local = 0; local < dim; ++local) {
+      acc += static_cast<float>(grad_pre[m * total_pre + pre_start + local]) *
+             static_cast<float>(weight[local * hidden + h]);
+      acc += static_cast<float>(grad_pre[m * total_pre + pre_start + dim + local]) *
+             static_cast<float>(weight[(dim + local) * hidden + h]);
+    }
+    grad_x[(m * band_count + band) * hidden + h] = static_cast<scalar_t>(acc);
+  }
+}
+
+template <typename scalar_t>
+__global__ void mask_estimator_final_direct_glu_grad_x_kernel(
+    const scalar_t* __restrict__ grad_out,
+    const scalar_t* __restrict__ pre,
+    const scalar_t* const* __restrict__ weights,
+    scalar_t* __restrict__ grad_pre,
+    scalar_t* __restrict__ grad_bias,
+    scalar_t* __restrict__ grad_x,
+    const int64_t* __restrict__ offsets,
+    int64_t m_count,
+    int64_t band_count,
+    int64_t hidden,
+    int64_t total,
+    int64_t total_pre) {
+  extern __shared__ float shared[];
+  const int64_t m = blockIdx.x;
+  const int64_t band = blockIdx.y;
+  const int tid = threadIdx.x;
+  const int64_t start = offsets[band];
+  const int64_t end = offsets[band + 1];
+  const int64_t dim = end - start;
+  const int64_t pre_start = start * 2;
+  const scalar_t* weight = weights[band];
+
+  if (blockIdx.z == 0) {
+    for (int64_t local = tid; local < dim; local += blockDim.x) {
+      const int64_t pre_left_offset = pre_start + local;
+      const int64_t pre_gate_offset = pre_start + dim + local;
+      const float left = static_cast<float>(pre[m * total_pre + pre_left_offset]);
+      const float gate_pre = static_cast<float>(pre[m * total_pre + pre_gate_offset]);
+      const float gate = 1.0f / (1.0f + expf(-gate_pre));
+      const float grad = static_cast<float>(grad_out[m * total + start + local]);
+      grad_pre[m * total_pre + pre_left_offset] = static_cast<scalar_t>(grad * gate);
+      grad_pre[m * total_pre + pre_gate_offset] = static_cast<scalar_t>(grad * left * gate * (1.0f - gate));
+    }
+    for (int64_t h = tid; h < hidden; h += blockDim.x) {
+      float acc = 0.0f;
+      for (int64_t local = 0; local < dim; ++local) {
+        const int64_t pre_left_offset = pre_start + local;
+        const int64_t pre_gate_offset = pre_start + dim + local;
+        const float left = static_cast<float>(pre[m * total_pre + pre_left_offset]);
+        const float gate_pre = static_cast<float>(pre[m * total_pre + pre_gate_offset]);
+        const float gate = 1.0f / (1.0f + expf(-gate_pre));
+        const float grad = static_cast<float>(grad_out[m * total + start + local]);
+        const float grad_left = grad * gate;
+        const float grad_gate = grad * left * gate * (1.0f - gate);
+        acc += grad_left * static_cast<float>(weight[local * hidden + h]);
+        acc += grad_gate * static_cast<float>(weight[(dim + local) * hidden + h]);
+      }
+      grad_x[(m * band_count + band) * hidden + h] = static_cast<scalar_t>(acc);
+    }
+  }
+
+  if (m == 0) {
+    for (int64_t local = blockIdx.z; local < dim; local += gridDim.z) {
+      const int64_t pre_left_offset = pre_start + local;
+      const int64_t pre_gate_offset = pre_start + dim + local;
+      float bias_left = 0.0f;
+      float bias_gate = 0.0f;
+      for (int64_t row = tid; row < m_count; row += blockDim.x) {
+        const float left = static_cast<float>(pre[row * total_pre + pre_left_offset]);
+        const float gate_pre = static_cast<float>(pre[row * total_pre + pre_gate_offset]);
+        const float gate = 1.0f / (1.0f + expf(-gate_pre));
+        const float grad = static_cast<float>(grad_out[row * total + start + local]);
+        bias_left += grad * gate;
+        bias_gate += grad * left * gate * (1.0f - gate);
+      }
+      float* shared_left = shared;
+      float* shared_gate = shared + blockDim.x;
+      shared_left[tid] = bias_left;
+      shared_gate[tid] = bias_gate;
+      __syncthreads();
+      for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+          shared_left[tid] += shared_left[tid + stride];
+          shared_gate[tid] += shared_gate[tid + stride];
+        }
+        __syncthreads();
+      }
+      if (tid == 0) {
+        grad_bias[pre_left_offset] = static_cast<scalar_t>(shared_left[0]);
+        grad_bias[pre_gate_offset] = static_cast<scalar_t>(shared_gate[0]);
+      }
+    }
+  }
+}
+
+template <typename scalar_t>
+__global__ void mask_estimator_final_direct_grad_weight_kernel(
+    const scalar_t* __restrict__ grad_pre,
+    const scalar_t* __restrict__ x,
+    scalar_t* const* __restrict__ grad_weights,
+    const int64_t* __restrict__ offsets,
+    int64_t m_count,
+    int64_t band_count,
+    int64_t hidden,
+    int64_t max_pre_out,
+    int64_t total_pre) {
+  const int64_t band = blockIdx.x;
+  const int64_t row = blockIdx.y;
+  const int tid = threadIdx.x;
+  const int64_t start = offsets[band];
+  const int64_t end = offsets[band + 1];
+  const int64_t dim = end - start;
+  const int64_t pre_out = dim * 2;
+  if (row >= pre_out || row >= max_pre_out) {
+    return;
+  }
+  const int64_t pre_start = start * 2;
+  scalar_t* grad_weight = grad_weights[band];
+
+  for (int64_t h = tid; h < hidden; h += blockDim.x) {
+    float acc = 0.0f;
+    for (int64_t m = 0; m < m_count; ++m) {
+      acc += static_cast<float>(grad_pre[m * total_pre + pre_start + row]) *
+             static_cast<float>(x[(m * band_count + band) * hidden + h]);
+    }
+    grad_weight[row * hidden + h] = static_cast<scalar_t>(acc);
+  }
+}
+
+std::vector<at::Tensor> mask_estimator_final_direct_forward_cuda(
+    const at::Tensor& x,
+    const std::vector<at::Tensor>& weights,
+    const at::Tensor& bias,
+    const std::vector<int64_t>& dim_inputs,
+    const at::Tensor& dim_offsets) {
+  const c10::cuda::CUDAGuard device_guard(x.device());
+  auto x_contiguous = x.contiguous();
+  auto bias_contiguous = bias.contiguous();
+
+  const auto m_count = x_contiguous.size(0);
+  const auto band_count = x_contiguous.size(1);
+  const auto hidden = x_contiguous.size(2);
+  const auto offsets = dim_offsets_from_inputs(dim_inputs);
+  const auto total = offsets.back();
+  const auto total_pre = total * 2;
+
+  auto pre = at::empty({m_count, total_pre}, x_contiguous.options());
+  auto out = at::empty({m_count, total}, x_contiguous.options());
+
+  const int threads = 256;
+  const auto stream = at::cuda::getCurrentCUDAStream();
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::Half,
+      at::ScalarType::BFloat16,
+      x.scalar_type(),
+      "mask_estimator_final_direct_forward_cuda",
+      [&] {
+        std::vector<at::Tensor> weight_contiguous;
+        std::vector<const scalar_t*> weight_ptrs;
+        weight_contiguous.reserve(weights.size());
+        weight_ptrs.reserve(weights.size());
+        for (size_t index = 0; index < weights.size(); ++index) {
+          weight_contiguous.push_back(contiguous_if_needed(weights[index]));
+          weight_ptrs.push_back(weight_contiguous.back().data_ptr<scalar_t>());
+        }
+        auto weight_ptr_tensor = tensor_from_host_ptrs(weight_ptrs, x_contiguous.options());
+        mask_estimator_final_direct_forward_kernel<scalar_t><<<dim3(m_count, band_count), threads, 0, stream>>>(
+            x_contiguous.data_ptr<scalar_t>(),
+            reinterpret_cast<const scalar_t* const*>(weight_ptr_tensor.data_ptr<int64_t>()),
+            bias_contiguous.data_ptr<scalar_t>(),
+            pre.data_ptr<scalar_t>(),
+            out.data_ptr<scalar_t>(),
+            dim_offsets.data_ptr<int64_t>(),
+            m_count,
+            band_count,
+            hidden,
+            total,
+            total_pre);
+      });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {out, pre, x_contiguous};
+}
+
+std::vector<at::Tensor> mask_estimator_final_direct_backward_cuda(
+    const at::Tensor& grad_out,
+    const at::Tensor& x,
+    const at::Tensor& pre,
+    const std::vector<at::Tensor>& weights,
+    const std::vector<int64_t>& dim_inputs,
+    const at::Tensor& dim_offsets) {
+  const c10::cuda::CUDAGuard device_guard(grad_out.device());
+  auto grad_out_contiguous = grad_out.contiguous();
+  auto x_contiguous = x.contiguous();
+  auto pre_contiguous = pre.contiguous();
+
+  const auto m_count = x_contiguous.size(0);
+  const auto band_count = x_contiguous.size(1);
+  const auto hidden = x_contiguous.size(2);
+  const auto offsets = dim_offsets_from_inputs(dim_inputs);
+  const auto total = offsets.back();
+  const auto total_pre = total * 2;
+  const auto max_pre_out = *std::max_element(dim_inputs.begin(), dim_inputs.end()) * 2;
+
+  auto grad_pre = at::empty({m_count, total_pre}, grad_out_contiguous.options());
+  auto grad_bias = at::empty({total_pre}, grad_out_contiguous.options());
+  auto grad_x = at::empty_like(x_contiguous);
+  std::vector<at::Tensor> grad_weights;
+  grad_weights.reserve(weights.size());
+  for (const auto& weight : weights) {
+    grad_weights.push_back(at::empty_like(weight));
+  }
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::Half,
+      at::ScalarType::BFloat16,
+      grad_out.scalar_type(),
+      "mask_estimator_final_direct_backward_cuda",
+      [&] {
+        const int threads = 256;
+        const size_t shared_bytes = threads * sizeof(float) * 2;
+        const auto stream = at::cuda::getCurrentCUDAStream();
+
+        std::vector<at::Tensor> weight_contiguous;
+        std::vector<const scalar_t*> weight_ptrs;
+        std::vector<const scalar_t*> grad_weight_ptrs;
+        weight_contiguous.reserve(weights.size());
+        weight_ptrs.reserve(weights.size());
+        grad_weight_ptrs.reserve(weights.size());
+        for (size_t index = 0; index < weights.size(); ++index) {
+          weight_contiguous.push_back(contiguous_if_needed(weights[index]));
+          weight_ptrs.push_back(weight_contiguous.back().data_ptr<scalar_t>());
+          grad_weight_ptrs.push_back(grad_weights[index].data_ptr<scalar_t>());
+        }
+        auto weight_ptr_tensor = tensor_from_host_ptrs(weight_ptrs, grad_out_contiguous.options());
+        auto grad_weight_ptr_tensor = tensor_from_host_ptrs(grad_weight_ptrs, grad_out_contiguous.options());
+
+        mask_estimator_final_direct_glu_grad_x_kernel<scalar_t>
+            <<<dim3(m_count, band_count, max_pre_out / 2), threads, shared_bytes, stream>>>(
+                grad_out_contiguous.data_ptr<scalar_t>(),
+                pre_contiguous.data_ptr<scalar_t>(),
+                reinterpret_cast<const scalar_t* const*>(weight_ptr_tensor.data_ptr<int64_t>()),
+                grad_pre.data_ptr<scalar_t>(),
+                grad_bias.data_ptr<scalar_t>(),
+                grad_x.data_ptr<scalar_t>(),
+                dim_offsets.data_ptr<int64_t>(),
+                m_count,
+                band_count,
+                hidden,
+                total,
+                total_pre);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+        mask_estimator_final_direct_grad_weight_kernel<scalar_t><<<dim3(band_count, max_pre_out), threads, 0, stream>>>(
+            grad_pre.data_ptr<scalar_t>(),
+            x_contiguous.data_ptr<scalar_t>(),
+            reinterpret_cast<scalar_t* const*>(grad_weight_ptr_tensor.data_ptr<int64_t>()),
+            dim_offsets.data_ptr<int64_t>(),
+            m_count,
+            band_count,
+            hidden,
+            max_pre_out,
+            total_pre);
+      });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  std::vector<at::Tensor> result;
+  result.reserve(2 + grad_weights.size());
+  result.push_back(grad_x);
+  result.push_back(grad_bias);
+  for (auto& grad_weight : grad_weights) {
+    result.push_back(grad_weight);
+  }
+  return result;
 }

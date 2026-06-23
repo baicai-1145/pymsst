@@ -47,6 +47,7 @@ def _load_fused_band_split_extension_cached(verbose: bool) -> ModuleType:
             sources=[str(path) for path in sources],
             extra_cflags=["-O3"],
             extra_cuda_cflags=["-O3", "--use_fast_math"],
+            extra_ldflags=["-lcublas"],
             build_directory=build_directory,
             verbose=verbose,
             with_cuda=True,

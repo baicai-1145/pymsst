@@ -7,6 +7,7 @@ from typing import Any
 import pytorch_lightning as pl
 import torch
 from pytorch_lightning.callbacks import Callback
+from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 
 
 class LossCurveRecorder(Callback):
@@ -96,3 +97,69 @@ def _to_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+class ExponentialMovingAverage(Callback):
+    """Maintain EMA model weights and use them for validation, matching the original trainer."""
+
+    def __init__(self, decay: float) -> None:
+        self.decay = float(decay)
+        if not 0.0 < self.decay < 1.0:
+            raise ValueError("EMA decay must be in (0, 1)")
+        self.ema_model: AveragedModel | None = None
+        self._stored_state: dict[str, torch.Tensor] | None = None
+        self._pending_ema_state: dict[str, torch.Tensor] | None = None
+
+    def on_fit_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        self.ema_model = AveragedModel(pl_module.model, multi_avg_fn=get_ema_multi_avg_fn(self.decay))
+        if self._pending_ema_state is not None:
+            self.ema_model.module.load_state_dict(self._pending_ema_state)
+            self._pending_ema_state = None
+        pl_module.ema_model = self.ema_model
+        pl_module.ema_decay = self.decay
+
+    def on_train_batch_end(
+        self,
+        trainer: pl.Trainer,
+        pl_module: pl.LightningModule,
+        outputs: Any,
+        batch: Any,
+        batch_idx: int,
+    ) -> None:
+        if self.ema_model is not None:
+            self.ema_model.update_parameters(pl_module.model)
+
+    def on_validation_epoch_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        if self.ema_model is None:
+            return
+        self._stored_state = {key: value.detach().clone() for key, value in pl_module.model.state_dict().items()}
+        pl_module.model.load_state_dict(self.ema_model.module.state_dict())
+        pl_module.using_ema_weights = True
+
+    def on_validation_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        self._restore_training_weights(pl_module)
+
+    def on_validation_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        self._restore_training_weights(pl_module)
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "decay": self.decay,
+            "ema_state_dict": None if self.ema_model is None else self.ema_model.module.state_dict(),
+        }
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        ema_state = state_dict.get("ema_state_dict")
+        if ema_state is None:
+            return
+        if self.ema_model is None:
+            self._pending_ema_state = ema_state
+        else:
+            self.ema_model.module.load_state_dict(ema_state)
+
+    def _restore_training_weights(self, pl_module: pl.LightningModule) -> None:
+        if self._stored_state is None:
+            return
+        pl_module.model.load_state_dict(self._stored_state)
+        pl_module.using_ema_weights = False
+        self._stored_state = None

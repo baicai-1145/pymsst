@@ -32,6 +32,23 @@ std::vector<at::Tensor> band_split_backward_v3_cuda(
     const at::Tensor& weight,
     bool has_bias);
 
+std::vector<at::Tensor> band_split_ragged_forward_cuda(
+    const at::Tensor& x,
+    const std::vector<at::Tensor>& gammas,
+    const std::vector<at::Tensor>& weights,
+    const std::vector<at::Tensor>& biases,
+    const std::vector<int64_t>& dim_inputs,
+    const at::Tensor& dim_offsets);
+
+std::vector<at::Tensor> band_split_ragged_backward_cuda(
+    const at::Tensor& grad_out,
+    const at::Tensor& normed,
+    const at::Tensor& inv_norm,
+    const std::vector<at::Tensor>& gammas,
+    const std::vector<at::Tensor>& weights,
+    const std::vector<int64_t>& dim_inputs,
+    const at::Tensor& dim_offsets);
+
 at::Tensor grouped_linear_forward_cuda(
     const at::Tensor& x,
     const at::Tensor& weight,
@@ -90,6 +107,36 @@ std::vector<at::Tensor> attention_gate_backward_cuda(
     const at::Tensor& x,
     const at::Tensor& weight,
     const at::Tensor& gate);
+
+std::vector<at::Tensor> mask_estimator_final_forward_cuda(
+    const at::Tensor& x,
+    const std::vector<at::Tensor>& weights,
+    const at::Tensor& bias,
+    const std::vector<int64_t>& dim_inputs,
+    const at::Tensor& dim_offsets);
+
+std::vector<at::Tensor> mask_estimator_final_backward_cuda(
+    const at::Tensor& grad_out,
+    const at::Tensor& x,
+    const at::Tensor& pre,
+    const std::vector<at::Tensor>& weights,
+    const std::vector<int64_t>& dim_inputs,
+    const at::Tensor& dim_offsets);
+
+std::vector<at::Tensor> mask_estimator_final_direct_forward_cuda(
+    const at::Tensor& x,
+    const std::vector<at::Tensor>& weights,
+    const at::Tensor& bias,
+    const std::vector<int64_t>& dim_inputs,
+    const at::Tensor& dim_offsets);
+
+std::vector<at::Tensor> mask_estimator_final_direct_backward_cuda(
+    const at::Tensor& grad_out,
+    const at::Tensor& x,
+    const at::Tensor& pre,
+    const std::vector<at::Tensor>& weights,
+    const std::vector<int64_t>& dim_inputs,
+    const at::Tensor& dim_offsets);
 
 std::vector<at::Tensor> band_split_forward(
     const at::Tensor& x,
@@ -219,6 +266,100 @@ std::vector<at::Tensor> band_split_backward_v3(
   TORCH_CHECK(weight.scalar_type() == grad_out.scalar_type(), "weight dtype must match grad_out");
   TORCH_CHECK(inv_norm.scalar_type() == at::kFloat, "inv_norm must be float32");
   return band_split_backward_v3_cuda(grad_out, normed, inv_norm, gamma, weight, has_bias);
+}
+
+std::vector<at::Tensor> band_split_ragged_forward(
+    const at::Tensor& x,
+    const std::vector<at::Tensor>& gammas,
+    const std::vector<at::Tensor>& weights,
+    const std::vector<at::Tensor>& biases,
+    const std::vector<int64_t>& dim_inputs,
+    const at::Tensor& dim_offsets) {
+  TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
+  TORCH_CHECK(dim_offsets.is_cuda(), "dim_offsets must be a CUDA tensor");
+  TORCH_CHECK(x.dim() == 2, "x must have shape [M, total]");
+  TORCH_CHECK(dim_offsets.dim() == 1, "dim_offsets must be 1D");
+  TORCH_CHECK(dim_offsets.scalar_type() == at::kLong, "dim_offsets must be int64");
+  TORCH_CHECK(gammas.size() == weights.size(), "gammas length must match weights length");
+  TORCH_CHECK(biases.size() == weights.size(), "biases length must match weights length");
+  TORCH_CHECK(dim_inputs.size() == weights.size(), "dim_inputs length must match weights length");
+  TORCH_CHECK(dim_offsets.size(0) == static_cast<int64_t>(weights.size() + 1), "dim_offsets length must be band count + 1");
+  TORCH_CHECK(!weights.empty(), "weights must not be empty");
+  const auto out_features = weights[0].size(0);
+  int64_t total = 0;
+  for (size_t i = 0; i < weights.size(); ++i) {
+    const auto& gamma = gammas[i];
+    const auto& weight = weights[i];
+    const auto& bias = biases[i];
+    total += dim_inputs[i];
+    TORCH_CHECK(gamma.is_cuda(), "gamma must be a CUDA tensor");
+    TORCH_CHECK(weight.is_cuda(), "weight must be a CUDA tensor");
+    TORCH_CHECK(bias.is_cuda(), "bias must be a CUDA tensor");
+    TORCH_CHECK(gamma.dim() == 1, "gamma must have shape [I]");
+    TORCH_CHECK(weight.dim() == 2, "weight must have shape [O, I]");
+    TORCH_CHECK(bias.dim() == 1, "bias must have shape [O]");
+    TORCH_CHECK(gamma.size(0) == dim_inputs[i], "gamma dimension must match dim_inputs");
+    TORCH_CHECK(weight.size(0) == out_features, "all weights must share output dimension");
+    TORCH_CHECK(weight.size(1) == dim_inputs[i], "weight input dimension must match dim_inputs");
+    TORCH_CHECK(bias.size(0) == out_features, "bias output dimension must match weight");
+    TORCH_CHECK(gamma.scalar_type() == x.scalar_type(), "gamma dtype must match x");
+    TORCH_CHECK(weight.scalar_type() == x.scalar_type(), "weight dtype must match x");
+    TORCH_CHECK(bias.scalar_type() == x.scalar_type(), "bias dtype must match x");
+    TORCH_CHECK(gamma.device() == x.device(), "gamma device must match x");
+    TORCH_CHECK(weight.device() == x.device(), "weight device must match x");
+    TORCH_CHECK(bias.device() == x.device(), "bias device must match x");
+  }
+  TORCH_CHECK(x.size(1) == total, "x total dimension must match dim_inputs");
+  return band_split_ragged_forward_cuda(x, gammas, weights, biases, dim_inputs, dim_offsets);
+}
+
+std::vector<at::Tensor> band_split_ragged_backward(
+    const at::Tensor& grad_out,
+    const at::Tensor& normed,
+    const at::Tensor& inv_norm,
+    const std::vector<at::Tensor>& gammas,
+    const std::vector<at::Tensor>& weights,
+    const std::vector<int64_t>& dim_inputs,
+    const at::Tensor& dim_offsets) {
+  TORCH_CHECK(grad_out.is_cuda(), "grad_out must be a CUDA tensor");
+  TORCH_CHECK(normed.is_cuda(), "normed must be a CUDA tensor");
+  TORCH_CHECK(inv_norm.is_cuda(), "inv_norm must be a CUDA tensor");
+  TORCH_CHECK(dim_offsets.is_cuda(), "dim_offsets must be a CUDA tensor");
+  TORCH_CHECK(grad_out.dim() == 3, "grad_out must have shape [M, B, O]");
+  TORCH_CHECK(normed.dim() == 2, "normed must have shape [M, total]");
+  TORCH_CHECK(inv_norm.dim() == 2, "inv_norm must have shape [M, B]");
+  TORCH_CHECK(dim_offsets.dim() == 1, "dim_offsets must be 1D");
+  TORCH_CHECK(dim_offsets.scalar_type() == at::kLong, "dim_offsets must be int64");
+  TORCH_CHECK(gammas.size() == weights.size(), "gammas length must match weights length");
+  TORCH_CHECK(dim_inputs.size() == weights.size(), "dim_inputs length must match weights length");
+  TORCH_CHECK(dim_offsets.size(0) == static_cast<int64_t>(weights.size() + 1), "dim_offsets length must be band count + 1");
+  TORCH_CHECK(!weights.empty(), "weights must not be empty");
+  TORCH_CHECK(normed.size(0) == grad_out.size(0), "normed M must match grad_out");
+  TORCH_CHECK(inv_norm.size(0) == grad_out.size(0), "inv_norm M must match grad_out");
+  TORCH_CHECK(inv_norm.size(1) == grad_out.size(1), "inv_norm band count must match grad_out");
+  TORCH_CHECK(static_cast<int64_t>(weights.size()) == grad_out.size(1), "weights length must match grad_out band count");
+  TORCH_CHECK(normed.scalar_type() == grad_out.scalar_type(), "normed dtype must match grad_out");
+  TORCH_CHECK(inv_norm.scalar_type() == at::kFloat, "inv_norm must be float32");
+  const auto out_features = grad_out.size(2);
+  int64_t total = 0;
+  for (size_t i = 0; i < weights.size(); ++i) {
+    const auto& gamma = gammas[i];
+    const auto& weight = weights[i];
+    total += dim_inputs[i];
+    TORCH_CHECK(gamma.is_cuda(), "gamma must be a CUDA tensor");
+    TORCH_CHECK(weight.is_cuda(), "weight must be a CUDA tensor");
+    TORCH_CHECK(gamma.dim() == 1, "gamma must have shape [I]");
+    TORCH_CHECK(weight.dim() == 2, "weight must have shape [O, I]");
+    TORCH_CHECK(gamma.size(0) == dim_inputs[i], "gamma dimension must match dim_inputs");
+    TORCH_CHECK(weight.size(0) == out_features, "weight output dimension must match grad_out");
+    TORCH_CHECK(weight.size(1) == dim_inputs[i], "weight input dimension must match dim_inputs");
+    TORCH_CHECK(gamma.scalar_type() == grad_out.scalar_type(), "gamma dtype must match grad_out");
+    TORCH_CHECK(weight.scalar_type() == grad_out.scalar_type(), "weight dtype must match grad_out");
+    TORCH_CHECK(gamma.device() == grad_out.device(), "gamma device must match grad_out");
+    TORCH_CHECK(weight.device() == grad_out.device(), "weight device must match grad_out");
+  }
+  TORCH_CHECK(normed.size(1) == total, "normed total dimension must match dim_inputs");
+  return band_split_ragged_backward_cuda(grad_out, normed, inv_norm, gammas, weights, dim_inputs, dim_offsets);
 }
 
 at::Tensor grouped_linear_forward(
@@ -445,11 +586,155 @@ std::vector<at::Tensor> attention_gate_backward(
   return attention_gate_backward_cuda(grad_out, attn, x, weight, gate);
 }
 
+std::vector<at::Tensor> mask_estimator_final_forward(
+    const at::Tensor& x,
+    const std::vector<at::Tensor>& weights,
+    const at::Tensor& bias,
+    const std::vector<int64_t>& dim_inputs,
+    const at::Tensor& dim_offsets) {
+  TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
+  TORCH_CHECK(bias.is_cuda(), "bias must be a CUDA tensor");
+  TORCH_CHECK(dim_offsets.is_cuda(), "dim_offsets must be a CUDA tensor");
+  TORCH_CHECK(x.dim() == 3, "x must have shape [M, G, H]");
+  TORCH_CHECK(bias.dim() == 1, "bias must have shape [2 * total]");
+  TORCH_CHECK(dim_offsets.dim() == 1, "dim_offsets must be 1D");
+  TORCH_CHECK(dim_offsets.scalar_type() == at::kLong, "dim_offsets must be int64");
+  TORCH_CHECK(weights.size() == static_cast<size_t>(x.size(1)), "weights length must match band count");
+  TORCH_CHECK(dim_inputs.size() == weights.size(), "dim_inputs length must match weights length");
+  TORCH_CHECK(dim_offsets.size(0) == x.size(1) + 1, "dim_offsets length must be band count + 1");
+  int64_t total = 0;
+  for (const auto dim : dim_inputs) {
+    total += dim;
+  }
+  TORCH_CHECK(bias.size(0) == total * 2, "bias dimension must match dim_inputs");
+  TORCH_CHECK(bias.scalar_type() == x.scalar_type(), "bias dtype must match x");
+  TORCH_CHECK(bias.device() == x.device(), "bias device must match x");
+  for (size_t i = 0; i < weights.size(); ++i) {
+    const auto& weight = weights[i];
+    TORCH_CHECK(weight.is_cuda(), "weight must be a CUDA tensor");
+    TORCH_CHECK(weight.dim() == 2, "weight must have shape [2 * O, H]");
+    TORCH_CHECK(weight.size(1) == x.size(2), "weight hidden dimension must match x");
+    TORCH_CHECK(weight.size(0) == dim_inputs[i] * 2, "weight output dimension must match dim_inputs");
+    TORCH_CHECK(weight.scalar_type() == x.scalar_type(), "weight dtype must match x");
+    TORCH_CHECK(weight.device() == x.device(), "weight device must match x");
+  }
+  return mask_estimator_final_forward_cuda(x, weights, bias, dim_inputs, dim_offsets);
+}
+
+std::vector<at::Tensor> mask_estimator_final_backward(
+    const at::Tensor& grad_out,
+    const at::Tensor& x,
+    const at::Tensor& pre,
+    const std::vector<at::Tensor>& weights,
+    const std::vector<int64_t>& dim_inputs,
+    const at::Tensor& dim_offsets) {
+  TORCH_CHECK(grad_out.is_cuda(), "grad_out must be a CUDA tensor");
+  TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
+  TORCH_CHECK(pre.is_cuda(), "pre must be a CUDA tensor");
+  TORCH_CHECK(dim_offsets.is_cuda(), "dim_offsets must be a CUDA tensor");
+  TORCH_CHECK(grad_out.dim() == 2, "grad_out must have shape [M, total]");
+  TORCH_CHECK(x.dim() == 3, "x must have shape [M, G, H]");
+  TORCH_CHECK(pre.dim() == 2, "pre must have shape [M, 2 * total]");
+  TORCH_CHECK(grad_out.size(0) == x.size(0), "grad_out M must match x");
+  TORCH_CHECK(pre.size(0) == x.size(0), "pre M must match x");
+  TORCH_CHECK(pre.size(1) == grad_out.size(1) * 2, "pre total dimension must be twice grad_out");
+  TORCH_CHECK(dim_offsets.dim() == 1, "dim_offsets must be 1D");
+  TORCH_CHECK(dim_offsets.scalar_type() == at::kLong, "dim_offsets must be int64");
+  TORCH_CHECK(weights.size() == static_cast<size_t>(x.size(1)), "weights length must match band count");
+  TORCH_CHECK(dim_inputs.size() == weights.size(), "dim_inputs length must match weights length");
+  TORCH_CHECK(dim_offsets.size(0) == x.size(1) + 1, "dim_offsets length must be band count + 1");
+  TORCH_CHECK(grad_out.scalar_type() == x.scalar_type(), "grad_out dtype must match x");
+  TORCH_CHECK(pre.scalar_type() == x.scalar_type(), "pre dtype must match x");
+  for (size_t i = 0; i < weights.size(); ++i) {
+    const auto& weight = weights[i];
+    TORCH_CHECK(weight.is_cuda(), "weight must be a CUDA tensor");
+    TORCH_CHECK(weight.dim() == 2, "weight must have shape [2 * O, H]");
+    TORCH_CHECK(weight.size(1) == x.size(2), "weight hidden dimension must match x");
+    TORCH_CHECK(weight.size(0) == dim_inputs[i] * 2, "weight output dimension must match dim_inputs");
+    TORCH_CHECK(weight.scalar_type() == x.scalar_type(), "weight dtype must match x");
+    TORCH_CHECK(weight.device() == x.device(), "weight device must match x");
+  }
+  return mask_estimator_final_backward_cuda(grad_out, x, pre, weights, dim_inputs, dim_offsets);
+}
+
+std::vector<at::Tensor> mask_estimator_final_direct_forward(
+    const at::Tensor& x,
+    const std::vector<at::Tensor>& weights,
+    const at::Tensor& bias,
+    const std::vector<int64_t>& dim_inputs,
+    const at::Tensor& dim_offsets) {
+  TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
+  TORCH_CHECK(bias.is_cuda(), "bias must be a CUDA tensor");
+  TORCH_CHECK(dim_offsets.is_cuda(), "dim_offsets must be a CUDA tensor");
+  TORCH_CHECK(x.dim() == 3, "x must have shape [M, G, H]");
+  TORCH_CHECK(bias.dim() == 1, "bias must have shape [2 * total]");
+  TORCH_CHECK(dim_offsets.dim() == 1, "dim_offsets must be 1D");
+  TORCH_CHECK(dim_offsets.scalar_type() == at::kLong, "dim_offsets must be int64");
+  TORCH_CHECK(weights.size() == static_cast<size_t>(x.size(1)), "weights length must match band count");
+  TORCH_CHECK(dim_inputs.size() == weights.size(), "dim_inputs length must match weights length");
+  TORCH_CHECK(dim_offsets.size(0) == x.size(1) + 1, "dim_offsets length must be band count + 1");
+  int64_t total = 0;
+  for (const auto dim : dim_inputs) {
+    total += dim;
+  }
+  TORCH_CHECK(bias.size(0) == total * 2, "bias dimension must match dim_inputs");
+  TORCH_CHECK(bias.scalar_type() == x.scalar_type(), "bias dtype must match x");
+  TORCH_CHECK(bias.device() == x.device(), "bias device must match x");
+  for (size_t i = 0; i < weights.size(); ++i) {
+    const auto& weight = weights[i];
+    TORCH_CHECK(weight.is_cuda(), "weight must be a CUDA tensor");
+    TORCH_CHECK(weight.dim() == 2, "weight must have shape [2 * O, H]");
+    TORCH_CHECK(weight.size(1) == x.size(2), "weight hidden dimension must match x");
+    TORCH_CHECK(weight.size(0) == dim_inputs[i] * 2, "weight output dimension must match dim_inputs");
+    TORCH_CHECK(weight.scalar_type() == x.scalar_type(), "weight dtype must match x");
+    TORCH_CHECK(weight.device() == x.device(), "weight device must match x");
+  }
+  return mask_estimator_final_direct_forward_cuda(x, weights, bias, dim_inputs, dim_offsets);
+}
+
+std::vector<at::Tensor> mask_estimator_final_direct_backward(
+    const at::Tensor& grad_out,
+    const at::Tensor& x,
+    const at::Tensor& pre,
+    const std::vector<at::Tensor>& weights,
+    const std::vector<int64_t>& dim_inputs,
+    const at::Tensor& dim_offsets) {
+  TORCH_CHECK(grad_out.is_cuda(), "grad_out must be a CUDA tensor");
+  TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
+  TORCH_CHECK(pre.is_cuda(), "pre must be a CUDA tensor");
+  TORCH_CHECK(dim_offsets.is_cuda(), "dim_offsets must be a CUDA tensor");
+  TORCH_CHECK(grad_out.dim() == 2, "grad_out must have shape [M, total]");
+  TORCH_CHECK(x.dim() == 3, "x must have shape [M, G, H]");
+  TORCH_CHECK(pre.dim() == 2, "pre must have shape [M, 2 * total]");
+  TORCH_CHECK(grad_out.size(0) == x.size(0), "grad_out M must match x");
+  TORCH_CHECK(pre.size(0) == x.size(0), "pre M must match x");
+  TORCH_CHECK(pre.size(1) == grad_out.size(1) * 2, "pre total dimension must be twice grad_out");
+  TORCH_CHECK(dim_offsets.dim() == 1, "dim_offsets must be 1D");
+  TORCH_CHECK(dim_offsets.scalar_type() == at::kLong, "dim_offsets must be int64");
+  TORCH_CHECK(weights.size() == static_cast<size_t>(x.size(1)), "weights length must match band count");
+  TORCH_CHECK(dim_inputs.size() == weights.size(), "dim_inputs length must match weights length");
+  TORCH_CHECK(dim_offsets.size(0) == x.size(1) + 1, "dim_offsets length must be band count + 1");
+  TORCH_CHECK(grad_out.scalar_type() == x.scalar_type(), "grad_out dtype must match x");
+  TORCH_CHECK(pre.scalar_type() == x.scalar_type(), "pre dtype must match x");
+  for (size_t i = 0; i < weights.size(); ++i) {
+    const auto& weight = weights[i];
+    TORCH_CHECK(weight.is_cuda(), "weight must be a CUDA tensor");
+    TORCH_CHECK(weight.dim() == 2, "weight must have shape [2 * O, H]");
+    TORCH_CHECK(weight.size(1) == x.size(2), "weight hidden dimension must match x");
+    TORCH_CHECK(weight.size(0) == dim_inputs[i] * 2, "weight output dimension must match dim_inputs");
+    TORCH_CHECK(weight.scalar_type() == x.scalar_type(), "weight dtype must match x");
+    TORCH_CHECK(weight.device() == x.device(), "weight device must match x");
+  }
+  return mask_estimator_final_direct_backward_cuda(grad_out, x, pre, weights, dim_inputs, dim_offsets);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("band_split_forward", &band_split_forward, "Fused BandSplit grouped forward");
   m.def("band_split_backward", &band_split_backward, "Fused BandSplit grouped backward");
   m.def("band_split_backward_v2", &band_split_backward_v2, "Fused BandSplit grouped backward v2");
   m.def("band_split_backward_v3", &band_split_backward_v3, "Fused BandSplit grouped backward v3");
+  m.def("band_split_ragged_forward", &band_split_ragged_forward, "Fused BandSplit ragged forward");
+  m.def("band_split_ragged_backward", &band_split_ragged_backward, "Fused BandSplit ragged backward");
   m.def("grouped_linear_forward", &grouped_linear_forward, "Fused grouped linear forward");
   m.def("rotary_forward", &rotary_forward, "Fused rotary embedding forward");
   m.def("rotary_backward", &rotary_backward, "Fused rotary embedding backward");
@@ -461,4 +746,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("rms_norm_backward_mixed", &rms_norm_backward_mixed, "Fused mixed-dtype RMSNorm backward");
   m.def("attention_gate_forward", &attention_gate_forward, "Fused attention gate forward");
   m.def("attention_gate_backward", &attention_gate_backward, "Fused attention gate backward");
+  m.def("mask_estimator_final_forward", &mask_estimator_final_forward, "Fused MaskEstimator ragged final forward");
+  m.def("mask_estimator_final_backward", &mask_estimator_final_backward, "Fused MaskEstimator ragged final backward");
+  m.def("mask_estimator_final_direct_forward", &mask_estimator_final_direct_forward, "Direct MaskEstimator ragged final forward");
+  m.def("mask_estimator_final_direct_backward", &mask_estimator_final_direct_backward, "Direct MaskEstimator ragged final backward");
 }

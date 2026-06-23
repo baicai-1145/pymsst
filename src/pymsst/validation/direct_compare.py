@@ -141,6 +141,12 @@ def _run_pymsst_curve(
     config.training.fused_kernel_patched_band_splits = module.fused_training_status.patched_band_splits
     config.training.fused_kernel_patched_band_split_bwd_v2 = module.fused_training_status.patched_band_split_bwd_v2
     config.training.fused_kernel_patched_band_split_bwd_v3 = module.fused_training_status.patched_band_split_bwd_v3
+    config.training.fused_kernel_patched_band_split_ragged_forward = (
+        module.fused_training_status.patched_band_split_ragged_forward
+    )
+    config.training.fused_kernel_patched_band_split_ragged_backward = (
+        module.fused_training_status.patched_band_split_ragged_backward
+    )
     config.training.fused_kernel_patched_rotary = module.fused_training_status.patched_rotary
     config.training.fused_kernel_patched_rms_norm = module.fused_training_status.patched_rms_norm
     config.training.fused_kernel_rms_norm_mode = module.fused_training_status.rms_norm_mode
@@ -149,6 +155,14 @@ def _run_pymsst_curve(
     config.training.fused_kernel_patched_attention_gates = module.fused_training_status.patched_attention_gates
     config.training.fused_kernel_attention_gate_mode = module.fused_training_status.attention_gate_mode
     config.training.fused_kernel_patched_layout_reduce_copy = module.fused_training_status.patched_layout_reduce_copy
+    config.training.fused_kernel_patched_train_param_pack_autograd = (
+        module.fused_training_status.patched_train_param_pack_autograd
+    )
+    config.training.fused_kernel_patched_mask_final_autograd = (
+        module.fused_training_status.patched_mask_final_autograd
+    )
+    config.training.fused_kernel_patched_mask_estimator_final = module.fused_training_status.patched_mask_estimator_final
+    config.training.fused_kernel_mask_estimator_final_mode = module.fused_training_status.mask_estimator_final_mode
     if module.fused_training_status.reason:
         config.training.fused_kernel_reason = module.fused_training_status.reason
     normalized_cuda_graph_mode = normalize_cuda_graph_mode(cuda_graph_mode)
@@ -182,7 +196,7 @@ def _run_pymsst_curve(
     device = _device()
     module.to(device)
     module.train()
-    optimizer = module.configure_optimizers()
+    optimizer = _extract_optimizer(module.configure_optimizers())
     cuda_graph_runner = (
         RoformerMaskCoreCudaGraph(module.model, normalized_cuda_graph_mode)
         if normalized_cuda_graph_mode != "off" and device.type == "cuda"
@@ -366,6 +380,20 @@ def _run_manual_steps(
     if completed_steps != steps:
         raise RuntimeError(f"expected {steps} train steps, got {completed_steps}")
     return losses
+
+
+def _extract_optimizer(configured):
+    if isinstance(configured, torch.optim.Optimizer):
+        return configured
+    if isinstance(configured, dict) and isinstance(configured.get("optimizer"), torch.optim.Optimizer):
+        return configured["optimizer"]
+    if isinstance(configured, (list, tuple)) and configured:
+        first = configured[0]
+        if isinstance(first, torch.optim.Optimizer):
+            return first
+        if isinstance(first, dict) and isinstance(first.get("optimizer"), torch.optim.Optimizer):
+            return first["optimizer"]
+    raise TypeError(f"unsupported optimizer configuration: {type(configured).__name__}")
 
 
 def _should_record_loss(step: int, total_steps: int, interval: int) -> bool:

@@ -47,6 +47,9 @@ dependencies = [
 av = [
     "av>=14",
 ]
+tensorboard = [
+    "tensorboard>=2.19",
+]
 cuda-ext = [
     "ninja>=1.11",
 ]

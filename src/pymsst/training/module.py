@@ -16,6 +16,9 @@ from .fused_roformer import (
 from .losses import compute_loss, signal_to_distortion_ratio
 
 
+DEFAULT_TRAIN_CUDA_ATTENTION_BACKEND = "default"
+
+
 class SeparationLightningModule(pl.LightningModule):
     def __init__(
         self,
@@ -56,13 +59,13 @@ class SeparationLightningModule(pl.LightningModule):
         self.optimizer_backend = _normalize_optimizer_backend(
             optimizer_backend if optimizer_backend is not None else self.config.training.get("optimizer_backend", "default")
         )
-        self.cuda_attention_backend = _optional_string(
+        configured_cuda_attention_backend = (
             cuda_attention_backend if cuda_attention_backend is not None else self.config.training.get("cuda_attention_backend")
         )
+        self.cuda_attention_backend = _optional_string(configured_cuda_attention_backend) or DEFAULT_TRAIN_CUDA_ATTENTION_BACKEND
         self.config.training.optimizer_backend = self.optimizer_backend
-        if self.cuda_attention_backend is not None:
-            _set_cuda_attention_backend(self.model, self.cuda_attention_backend)
-            self.config.training.cuda_attention_backend = self.cuda_attention_backend
+        _set_cuda_attention_backend(self.model, self.cuda_attention_backend)
+        self.config.training.cuda_attention_backend = self.cuda_attention_backend
         self.fused_kernel_backend = normalize_fused_kernel_backend(
             fused_kernel_backend if fused_kernel_backend is not None else self.config.training.get("fused_kernel_backend")
         )
@@ -80,6 +83,12 @@ class SeparationLightningModule(pl.LightningModule):
         self.config.training.fused_kernel_patched_band_splits = self.fused_training_status.patched_band_splits
         self.config.training.fused_kernel_patched_band_split_bwd_v2 = self.fused_training_status.patched_band_split_bwd_v2
         self.config.training.fused_kernel_patched_band_split_bwd_v3 = self.fused_training_status.patched_band_split_bwd_v3
+        self.config.training.fused_kernel_patched_band_split_ragged_forward = (
+            self.fused_training_status.patched_band_split_ragged_forward
+        )
+        self.config.training.fused_kernel_patched_band_split_ragged_backward = (
+            self.fused_training_status.patched_band_split_ragged_backward
+        )
         self.config.training.fused_kernel_patched_rotary = self.fused_training_status.patched_rotary
         self.config.training.fused_kernel_patched_rms_norm = self.fused_training_status.patched_rms_norm
         self.config.training.fused_kernel_rms_norm_mode = self.fused_training_status.rms_norm_mode
@@ -88,6 +97,16 @@ class SeparationLightningModule(pl.LightningModule):
         self.config.training.fused_kernel_patched_attention_gates = self.fused_training_status.patched_attention_gates
         self.config.training.fused_kernel_attention_gate_mode = self.fused_training_status.attention_gate_mode
         self.config.training.fused_kernel_patched_layout_reduce_copy = self.fused_training_status.patched_layout_reduce_copy
+        self.config.training.fused_kernel_patched_train_param_pack_autograd = (
+            self.fused_training_status.patched_train_param_pack_autograd
+        )
+        self.config.training.fused_kernel_patched_mask_final_autograd = (
+            self.fused_training_status.patched_mask_final_autograd
+        )
+        self.config.training.fused_kernel_patched_mask_estimator_final = (
+            self.fused_training_status.patched_mask_estimator_final
+        )
+        self.config.training.fused_kernel_mask_estimator_final_mode = self.fused_training_status.mask_estimator_final_mode
         if self.fused_training_status.reason:
             self.config.training.fused_kernel_reason = self.fused_training_status.reason
         self.cuda_graph_mode = normalize_cuda_graph_mode(
@@ -98,6 +117,9 @@ class SeparationLightningModule(pl.LightningModule):
         self.config.training.cuda_graph_mode = self.cuda_graph_mode
         self.config.training.cuda_graph_active = self.cuda_graph_status.active
         self.train_log_interval = int(train_log_interval)
+        self.ema_model = None
+        self.ema_decay: float | None = None
+        self.using_ema_weights = False
         if self.train_log_interval < 0:
             raise ValueError("train_log_interval must be >= 0")
         self.config.training.train_log_interval = self.train_log_interval
@@ -124,6 +146,10 @@ class SeparationLightningModule(pl.LightningModule):
                 "fused_kernel_patched_band_splits": self.fused_training_status.patched_band_splits,
                 "fused_kernel_patched_band_split_bwd_v2": self.fused_training_status.patched_band_split_bwd_v2,
                 "fused_kernel_patched_band_split_bwd_v3": self.fused_training_status.patched_band_split_bwd_v3,
+                "fused_kernel_patched_band_split_ragged_forward": self.fused_training_status.patched_band_split_ragged_forward,
+                "fused_kernel_patched_band_split_ragged_backward": (
+                    self.fused_training_status.patched_band_split_ragged_backward
+                ),
                 "fused_kernel_patched_rotary": self.fused_training_status.patched_rotary,
                 "fused_kernel_patched_rms_norm": self.fused_training_status.patched_rms_norm,
                 "fused_kernel_rms_norm_mode": self.fused_training_status.rms_norm_mode,
@@ -132,6 +158,14 @@ class SeparationLightningModule(pl.LightningModule):
                 "fused_kernel_patched_attention_gates": self.fused_training_status.patched_attention_gates,
                 "fused_kernel_attention_gate_mode": self.fused_training_status.attention_gate_mode,
                 "fused_kernel_patched_layout_reduce_copy": self.fused_training_status.patched_layout_reduce_copy,
+                "fused_kernel_patched_train_param_pack_autograd": (
+                    self.fused_training_status.patched_train_param_pack_autograd
+                ),
+                "fused_kernel_patched_mask_final_autograd": (
+                    self.fused_training_status.patched_mask_final_autograd
+                ),
+                "fused_kernel_patched_mask_estimator_final": self.fused_training_status.patched_mask_estimator_final,
+                "fused_kernel_mask_estimator_final_mode": self.fused_training_status.mask_estimator_final_mode,
                 "cuda_graph_mode": self.cuda_graph_mode,
                 "cuda_graph_active": self.cuda_graph_status.active,
                 "train_log_interval": self.train_log_interval,
@@ -157,6 +191,8 @@ class SeparationLightningModule(pl.LightningModule):
         )
         if self.train_log_interval and (batch_idx + 1) % self.train_log_interval == 0:
             self.log("train/loss", loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
+            self.log("loss", loss * 100.0, on_step=True, on_epoch=False, sync_dist=True)
+            self.log("learning_rate", self.trainer.optimizers[0].param_groups[0]["lr"], on_step=True, on_epoch=False)
         return loss
 
     def validation_step(self, batch: tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> dict[str, torch.Tensor]:
@@ -175,6 +211,10 @@ class SeparationLightningModule(pl.LightningModule):
         self.log("val/loss", loss, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log("val/sdr", sdr, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log("val_sdr", sdr, on_epoch=True, sync_dist=True)
+        self.log("metric_main", sdr, on_epoch=True, sync_dist=True)
+        self.log("metric_sdr", sdr, on_epoch=True, sync_dist=True)
+        for stem, stem_sdr in _per_stem_sdr(prediction, target, tuple(self.config.training.instruments)).items():
+            self.log(f"metric_sdr_{stem}", stem_sdr, on_epoch=True, sync_dist=True)
         return {"val_loss": loss.detach(), "val_sdr": sdr.detach()}
 
     def _prediction_for_loss(self, prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -192,10 +232,33 @@ class SeparationLightningModule(pl.LightningModule):
         optimizer_name = str(self.config.training.get("optimizer", "adam")).lower()
         optimizer_kwargs = _optimizer_backend_kwargs(self.optimizer_backend)
         if optimizer_name == "adamw":
-            return torch.optim.AdamW(self.parameters(), lr=self.learning_rate, **optimizer_kwargs)
-        if optimizer_name == "adam":
-            return torch.optim.Adam(self.parameters(), lr=self.learning_rate, **optimizer_kwargs)
-        raise ValueError(f"unsupported optimizer for first-stage pymsst training: {optimizer_name}")
+            optimizer = torch.optim.AdamW(self.parameters(), lr=self.learning_rate, **optimizer_kwargs)
+        elif optimizer_name == "adam":
+            optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate, **optimizer_kwargs)
+        else:
+            raise ValueError(f"unsupported optimizer for first-stage pymsst training: {optimizer_name}")
+        scheduler_name = str(self.config.training.get("scheduler", "ReduceLROnPlateau"))
+        if scheduler_name == "ReduceLROnPlateau":
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer,
+                mode="max",
+                patience=int(self.config.training.get("patience", 2)),
+                factor=float(self.config.training.get("reduce_factor", 0.95)),
+            )
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {
+                    "scheduler": scheduler,
+                    "monitor": "val_sdr",
+                    "interval": "epoch",
+                    "frequency": 1,
+                },
+            }
+        if scheduler_name == "linear_scheduler":
+            raise ValueError("linear_scheduler compatibility requires transformers and is not enabled in pymsst yet")
+        if scheduler_name in {"", "none", "None", "off"}:
+            return optimizer
+        raise ValueError(f"unsupported scheduler for first-stage pymsst training: {scheduler_name}")
 
     def _cuda_graph_forward(self, mixture: torch.Tensor) -> torch.Tensor:
         if self._cuda_graph_runner is None:
@@ -250,6 +313,25 @@ def _optimizer_backend_kwargs(backend: str) -> dict[str, bool]:
     if backend == "fused_capturable":
         return {"fused": True, "capturable": True}
     raise ValueError("optimizer_backend must be one of: default, foreach, fused, fused_capturable")
+
+
+def _per_stem_sdr(prediction: torch.Tensor, target: torch.Tensor, instruments: tuple[str, ...]) -> dict[str, torch.Tensor]:
+    if prediction.ndim == 3 and target.ndim == 4 and target.shape[1] == 1:
+        stem_names = instruments[:1]
+        prediction = prediction[:, None]
+    elif prediction.ndim == 4 and target.ndim == 3 and prediction.shape[1] == 1:
+        stem_names = instruments[:1]
+        target = target[:, None]
+    elif prediction.ndim == 4 and target.ndim == 4:
+        stem_names = instruments[: prediction.shape[1]]
+    else:
+        return {}
+    if prediction.shape != target.shape or prediction.shape[1] != len(stem_names):
+        return {}
+    signal = target.pow(2).sum(dim=(2, 3))
+    noise = (target - prediction).pow(2).sum(dim=(2, 3))
+    values = 10.0 * torch.log10((signal + 1e-8) / (noise + 1e-8))
+    return {stem: values[:, index].mean() for index, stem in enumerate(stem_names)}
 
 
 def _optional_string(value: object) -> str | None:

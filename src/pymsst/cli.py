@@ -141,6 +141,32 @@ def build_parser() -> argparse.ArgumentParser:
     )
     compare_direct.set_defaults(func=_compare_direct)
 
+    compare_validation = subparsers.add_parser(
+        "compare-validation-direct",
+        help="Run original-style whole-track validation metrics for pymsst or original.",
+    )
+    compare_validation.add_argument("--implementation", choices=("pymsst", "original"), required=True)
+    compare_validation.add_argument("--model-type", choices=("bs_roformer", "mel_band_roformer"), required=True)
+    compare_validation.add_argument("--config-path", type=Path, required=True)
+    compare_validation.add_argument("--data-root", type=Path, default=Path("/root/pymsst/musdb18hq"))
+    compare_validation.add_argument("--results-path", type=Path, required=True)
+    compare_validation.add_argument("--seed", type=int, default=0)
+    compare_validation.add_argument("--val-tracks", type=int, default=1)
+    compare_validation.add_argument("--start-checkpoint", type=Path)
+    compare_validation.add_argument("--original-root", type=Path, default=Path("/root/Music-Source-Separation-Training"))
+    compare_validation.add_argument("--batch-size", type=int)
+    compare_validation.add_argument("--chunk-size", type=int)
+    compare_validation.set_defaults(func=_compare_validation_direct)
+
+    compare_validation_metrics = subparsers.add_parser(
+        "compare-validation-metrics",
+        help="Compare pymsst and original validation_metrics.json files.",
+    )
+    compare_validation_metrics.add_argument("--pymsst-metrics", type=Path, required=True)
+    compare_validation_metrics.add_argument("--original-metrics", type=Path, required=True)
+    compare_validation_metrics.add_argument("--output", type=Path)
+    compare_validation_metrics.set_defaults(func=_compare_validation_metrics)
+
     return parser
 
 
@@ -168,12 +194,12 @@ def _train(args: argparse.Namespace) -> int:
     import pytorch_lightning as pl
     import torch
     from pytorch_lightning.callbacks import ModelCheckpoint
-    from pytorch_lightning.loggers import CSVLogger
+    from pytorch_lightning.loggers import CSVLogger, TensorBoardLogger
     from pymss_core import to_plain
 
     from .data.datamodule import MusdbDataModule
     from .export import export_core_checkpoint
-    from .training import LossCurveRecorder, SeparationLightningModule
+    from .training import ExponentialMovingAverage, LossCurveRecorder, SeparationLightningModule
 
     pl.seed_everything(args.seed, workers=True)
 
@@ -262,6 +288,10 @@ def _train(args: argparse.Namespace) -> int:
                 "fused_kernel_patched_band_splits": module.fused_training_status.patched_band_splits,
                 "fused_kernel_patched_band_split_bwd_v2": module.fused_training_status.patched_band_split_bwd_v2,
                 "fused_kernel_patched_band_split_bwd_v3": module.fused_training_status.patched_band_split_bwd_v3,
+                "fused_kernel_patched_band_split_ragged_forward": module.fused_training_status.patched_band_split_ragged_forward,
+                "fused_kernel_patched_band_split_ragged_backward": (
+                    module.fused_training_status.patched_band_split_ragged_backward
+                ),
                 "fused_kernel_patched_rotary": module.fused_training_status.patched_rotary,
                 "fused_kernel_patched_rms_norm": module.fused_training_status.patched_rms_norm,
                 "fused_kernel_rms_norm_mode": module.fused_training_status.rms_norm_mode,
@@ -270,6 +300,14 @@ def _train(args: argparse.Namespace) -> int:
                 "fused_kernel_patched_attention_gates": module.fused_training_status.patched_attention_gates,
                 "fused_kernel_attention_gate_mode": module.fused_training_status.attention_gate_mode,
                 "fused_kernel_patched_layout_reduce_copy": module.fused_training_status.patched_layout_reduce_copy,
+                "fused_kernel_patched_train_param_pack_autograd": (
+                    module.fused_training_status.patched_train_param_pack_autograd
+                ),
+                "fused_kernel_patched_mask_final_autograd": (
+                    module.fused_training_status.patched_mask_final_autograd
+                ),
+                "fused_kernel_patched_mask_estimator_final": module.fused_training_status.patched_mask_estimator_final,
+                "fused_kernel_mask_estimator_final_mode": module.fused_training_status.mask_estimator_final_mode,
                 "cuda_graph_mode": module.cuda_graph_mode,
                 "cuda_graph_active": module.cuda_graph_status.active,
                 "cuda_graph_reason": module.cuda_graph_status.reason,
@@ -285,6 +323,8 @@ def _train(args: argparse.Namespace) -> int:
             },
         )
     no_validation = args.val_tracks is not None and args.val_tracks <= 0
+    if no_validation and str(config.training.get("scheduler", "ReduceLROnPlateau")) == "ReduceLROnPlateau":
+        config.training.scheduler = "off"
     if no_validation:
         checkpoint = ModelCheckpoint(
             dirpath=run_dir / "checkpoints",
@@ -305,6 +345,10 @@ def _train(args: argparse.Namespace) -> int:
             save_on_train_epoch_end=False,
             auto_insert_metric_name=False,
         )
+    callbacks = [checkpoint, LossCurveRecorder(loss_history_path, interval=args.loss_history_interval)]
+    ema_momentum = float(config.training.get("ema_momentum", 0) or 0)
+    if ema_momentum > 0:
+        callbacks.append(ExponentialMovingAverage(ema_momentum))
     trainer_kwargs = {"num_sanity_val_steps": 0} if no_validation else {}
     trainer = pl.Trainer(
         accelerator=args.accelerator,
@@ -316,8 +360,8 @@ def _train(args: argparse.Namespace) -> int:
         accumulate_grad_batches=accumulate_grad_batches,
         gradient_clip_val=gradient_clip_val,
         default_root_dir=run_dir,
-        callbacks=[checkpoint, LossCurveRecorder(loss_history_path, interval=args.loss_history_interval)],
-        logger=CSVLogger(save_dir=run_dir, name="logs"),
+        callbacks=callbacks,
+        logger=_training_loggers(run_dir, CSVLogger, TensorBoardLogger),
         log_every_n_steps=args.log_every_n_steps,
         enable_progress_bar=not args.disable_progress_bar,
         **trainer_kwargs,
@@ -334,13 +378,17 @@ def _train(args: argparse.Namespace) -> int:
             {
                 "cuda_graph_active": module.cuda_graph_status.active,
                 "cuda_graph_reason": module.cuda_graph_status.reason,
+                "ema_active": module.ema_decay is not None,
+                "ema_decay": module.ema_decay,
+                "scheduler": str(config.training.get("scheduler", "ReduceLROnPlateau")),
                 "config": to_plain(config),
             },
         )
 
     if args.export_core_checkpoint and trainer.is_global_zero:
+        export_model = module.ema_model.module if module.ema_model is not None else module.model
         export_core_checkpoint(
-            module.model,
+            export_model,
             args.export_core_checkpoint,
             model_type=args.model_type,
             config=config,
@@ -348,6 +396,8 @@ def _train(args: argparse.Namespace) -> int:
                 "source": "pymsst",
                 "lightning_checkpoint": str(checkpoint.last_model_path or ""),
                 "global_step": int(trainer.global_step),
+                "ema_active": module.ema_model is not None,
+                "ema_decay": module.ema_decay,
             },
         )
         print(f"Exported pymss-core checkpoint: {args.export_core_checkpoint}")
@@ -443,6 +493,41 @@ def _compare_direct(args: argparse.Namespace) -> int:
     return 0
 
 
+def _compare_validation_direct(args: argparse.Namespace) -> int:
+    from .validation import run_direct_validation_metrics
+
+    metadata = run_direct_validation_metrics(
+        implementation=args.implementation,
+        model_type=args.model_type,
+        config_path=args.config_path,
+        data_root=args.data_root,
+        results_path=args.results_path,
+        seed=args.seed,
+        val_tracks=args.val_tracks,
+        start_checkpoint=args.start_checkpoint,
+        original_root=args.original_root,
+        batch_size=args.batch_size,
+        chunk_size=args.chunk_size,
+    )
+    print(f"Wrote validation metrics: {Path(metadata['results_path']) / 'validation_metrics.json'}")
+    return 0
+
+
+def _compare_validation_metrics(args: argparse.Namespace) -> int:
+    from .validation import compare_validation_metrics
+
+    payload = compare_validation_metrics(
+        args.pymsst_metrics,
+        args.original_metrics,
+        output=args.output,
+    )
+    if args.output:
+        print(f"Wrote validation comparison: {args.output}")
+    else:
+        print(json.dumps(payload, indent=2))
+    return 0
+
+
 def _consume_original_roformer_python_rng(model_type: str) -> None:
     if model_type in {"bs_roformer", "mel_band_roformer"}:
         # The original training process lazily imports RoFormer modules after
@@ -460,6 +545,15 @@ def _parse_devices(value: str) -> str | int | list[int]:
         return int(value)
     except ValueError:
         return value
+
+
+def _training_loggers(run_dir: Path, csv_logger_cls, tensorboard_logger_cls):
+    loggers = [csv_logger_cls(save_dir=run_dir, name="logs")]
+    try:
+        loggers.append(tensorboard_logger_cls(save_dir=run_dir, name="tensorboard"))
+    except (ImportError, ModuleNotFoundError):
+        pass
+    return loggers
 
 
 def _is_rank_zero_process() -> bool:
