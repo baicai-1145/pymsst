@@ -63,7 +63,7 @@ def train_speakers(args):
         raise ValueError("audio.channels must match the model stereo setting")
     model.to(device)
     maximum = model.max_speakers
-    batch_size = int(settings.get("batch_size", 2))
+    batch_size = int(args.batch_size if getattr(args, "batch_size", None) else settings.get("batch_size", 2))
     steps_per_epoch = int(settings.get("steps_per_epoch", 500))
     max_steps = args.steps if args.steps is not None else int(settings.get("max_steps", 20000))
     validate_every = int(settings.get("validate_every", 250))
@@ -132,7 +132,9 @@ def train_speakers(args):
             train.epoch = epoch
             generator = torch.Generator().manual_seed(seed + epoch)
             loader = DataLoader(train, batch_size=batch_size, shuffle=True, num_workers=args.num_workers,
-                                pin_memory=device.type == "cuda", generator=generator)
+                                pin_memory=device.type == "cuda", generator=generator,
+                                prefetch_factor=4 if args.num_workers else None,
+                                persistent_workers=bool(args.num_workers))
             for batch_index, (mixture, target, counts) in enumerate(loader):
                 if batch_index < offset:
                     continue

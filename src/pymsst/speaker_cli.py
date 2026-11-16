@@ -37,6 +37,7 @@ def add_speaker_commands(subparsers):
     train.add_argument("--resume", type=Path)
     train.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda", "mps"))
     train.add_argument("--steps", type=int)
+    train.add_argument("--batch-size", type=int, help="Override training.batch_size; sized to the device.")
     train.add_argument("--num-workers", type=int, default=2)
     train.add_argument("--noise-root", type=Path)
     train.set_defaults(func=_train)

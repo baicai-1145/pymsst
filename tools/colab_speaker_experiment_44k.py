@@ -13,6 +13,8 @@ import sys
 import tarfile
 from pathlib import Path
 
+import torch
+
 WORKSPACE = Path("/content/adaptive-speakers")
 RUN = Path("/content/runs/adaptive-44k-stereo")
 DATA = Path("/content/data")
@@ -84,14 +86,30 @@ def main():
     train = [*cli, "train-speakers", "--config", CONFIG,
              "--train-manifest", manifests / "train.jsonl",
              "--validation-manifest", manifests / "validation.jsonl",
-             "--run-dir", RUN, "--device", "cuda", "--num-workers", "4"]
+             "--run-dir", RUN, "--device", "cuda", "--num-workers", "8"]
+    # Fill the card: start big and step down only if the allocator refuses.
+    wanted = int(os.environ.get("SPEAKER_BATCH", "8"))
+    candidates = [wanted] + [size for size in (8, 4, 2, 1) if size < wanted]
+    batch = None
     if not (RUN / "last.pt").exists():
-        run([*train, "--steps", "20"])
+        for size in candidates:
+            try:
+                run([*train, "--steps", "20", "--batch-size", str(size)], label="smoke")
+                batch = size
+                break
+            except RuntimeError as error:
+                if "out of memory" not in str(error).lower():
+                    raise
+                print(json.dumps({"event": "oom", "batch": size}), flush=True)
+                shutil.rmtree(RUN, ignore_errors=True)
+        if batch is None:
+            raise RuntimeError("every candidate batch size ran out of memory")
+        resumed = torch.load(RUN / "last.pt", map_location="cpu", weights_only=True)["step"]
+        print(json.dumps({"event": "batch", "selected": batch, "smoke_step": resumed}), flush=True)
     if steps > 20:
-        run([*train, "--steps", str(steps), "--resume", RUN / "last.pt"])
+        run([*train, "--steps", str(steps), "--resume", RUN / "last.pt", "--batch-size", str(batch)], label="train")
 
     import soundfile as sf
-    import torch
     from pymss_core import get_model_from_config
 
     from pymsst.data.speakers import SpeakerMixtureDataset, validate_disjoint_manifests
