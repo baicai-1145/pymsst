@@ -11,7 +11,7 @@ from pathlib import Path
 
 CORPORA = {
     # name: (url, archive name, speaker directory pattern, prefix)
-    "vctk": ("https://datashare.ed.ac.uk/download/DS_10283_3443.zip", "VCTK-Corpus-0.92.zip", r"^p\d{3}$", "vctk"),
+    "vctk": ("https://datashare.ed.ac.uk/download/DS_10283_3443.zip", "VCTK-Corpus-0.92.zip", r"^(?:p\d{3}|s\d+)$", "vctk"),
     "vocalset": ("https://zenodo.org/api/records/10200775/files/VocalSet.zip/content", "VocalSet.zip", r"^(?:male|female)\d{1,2}$", "vocalset"),
 }
 # datashare.ed.ac.uk answers 403 to Colab egress; this HF mirror is the same 48 kHz corpus.
