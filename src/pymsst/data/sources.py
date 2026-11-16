@@ -102,11 +102,24 @@ def extract_parquet_audio(source, output, *, speaker_key="speaker_id", prefix=""
     return {"written": written, "sample_rates": sorted(rates)}
 
 
-def fetch_hf_corpus(name, root, *, timeout=120):
-    """Download and decode an HF-hosted audio corpus one shard at a time, deleting each shard after use."""
+def _download_shard(url, target, timeout):
+    if target.is_file() and target.stat().st_size:
+        return target
+    import urllib.request
+
+    partial = target.with_suffix(target.suffix + ".part")
+    with urllib.request.urlopen(url, timeout=timeout) as response, partial.open("wb") as handle:
+        shutil.copyfileobj(response, handle, length=8 * 1024 * 1024)
+    partial.replace(target)
+    return target
+
+
+def fetch_hf_corpus(name, root, *, timeout=120, downloads=4, max_shards=None):
+    """Download and decode an HF audio corpus, fetching several shards at once."""
     if name not in HF_CORPORA:
         raise ValueError(f"unknown HF corpus {name!r}; known: {', '.join(sorted(HF_CORPORA))}")
     import urllib.request
+    from concurrent.futures import ThreadPoolExecutor
 
     repo, prefix = HF_CORPORA[name]
     with urllib.request.urlopen(f"https://huggingface.co/api/datasets/{repo}/tree/main?recursive=true", timeout=timeout) as response:
@@ -114,26 +127,30 @@ def fetch_hf_corpus(name, root, *, timeout=120):
     shards = sorted(item["path"] for item in listing if item.get("type") == "file" and item["path"].endswith(".parquet"))
     if not shards:
         raise ValueError(f"{repo} has no parquet shards")
+    if max_shards:
+        shards = shards[:max_shards]
     root = Path(root).resolve()
     scratch = root / ".archives"
     scratch.mkdir(parents=True, exist_ok=True)
     done = root / prefix.rstrip("/") / ".shards"
     done.mkdir(parents=True, exist_ok=True)
+    pending = [(number, shard) for number, shard in enumerate(shards, 1) if not (done / f"{number:03d}").exists()]
     totals, rates = 0, set()
-    for number, shard in enumerate(shards, 1):
-        if (done / f"{number:03d}").exists():
-            continue
-        local = scratch / f"{name}-{number:03d}.parquet"
-        if not local.is_file():
-            url = f"https://huggingface.co/datasets/{repo}/resolve/main/{shard}"
-            with urllib.request.urlopen(url, timeout=timeout) as response, local.open("wb") as handle:
-                shutil.copyfileobj(response, handle, length=8 * 1024 * 1024)
-        summary = extract_parquet_audio(local, root, prefix=prefix + "/")
-        totals += summary["written"]
-        rates.update(summary["sample_rates"])
-        local.unlink()
-        (done / f"{number:03d}").write_text("ok\n")
-        print(f"{name}: shard {number}/{len(shards)} decoded, {totals} files total", flush=True)
+
+    def local_of(number):
+        return scratch / f"{name}-{number:03d}.parquet"
+
+    with ThreadPoolExecutor(max_workers=max(1, downloads)) as pool:
+        futures = {number: pool.submit(_download_shard, f"https://huggingface.co/datasets/{repo}/resolve/main/{shard}",
+                                      local_of(number), timeout) for number, shard in pending}
+        for number, _ in pending:
+            path = futures[number].result()
+            summary = extract_parquet_audio(path, root, prefix=prefix + "/")
+            totals += summary["written"]
+            rates.update(summary["sample_rates"])
+            path.unlink(missing_ok=True)
+            (done / f"{number:03d}").write_text("ok\n")
+            print(f"{name}: shard {number}/{len(shards)} decoded, {totals} files total", flush=True)
     (done.parent / ".fetch_complete").write_text(f"{len(shards)} shards\n")
     return {"written": totals, "shards": len(shards), "sample_rates": sorted(rates)}
 
