@@ -14,6 +14,8 @@ CORPORA = {
     "vctk": ("https://datashare.ed.ac.uk/download/DS_10283_3443.zip", "VCTK-Corpus-0.92.zip", r"^p\d{3}$", "vctk"),
     "vocalset": ("https://zenodo.org/api/records/10200775/files/VocalSet.zip/content", "VocalSet.zip", r"^(?:male|female)\d{1,2}$", "vocalset"),
 }
+# datashare.ed.ac.uk answers 403 to Colab egress; this HF mirror is the same 48 kHz corpus.
+HF_CORPORA = {"vctk-hf": ("sanchit-gandhi/vctk", "vctk")}
 AUDIO_SUFFIXES = {".wav", ".flac"}
 
 

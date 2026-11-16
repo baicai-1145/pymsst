@@ -114,6 +114,16 @@ def test_link_speaker_tree_maps_corpus_layouts_and_rejects_unknown(tmp_path):
         link_speaker_tree([tmp_path / 'vctk'], tmp_path / 'again', drop_patterns=['mic2'])
 
 
+def test_sources_module_exposes_known_corpora(tmp_path):
+    """A name used but never defined only fails at runtime, so assert the registry itself."""
+    from pymsst.data.sources import CORPORA, HF_CORPORA, fetch_hf_corpus
+
+    assert HF_CORPORA["vctk-hf"][0] == "sanchit-gandhi/vctk"
+    assert {"vctk", "vocalset"} <= set(CORPORA)
+    with pytest.raises(ValueError, match="unknown HF corpus"):
+        fetch_hf_corpus("nope", tmp_path)
+
+
 def test_hf_parquet_shard_decodes_into_per_speaker_flac(tmp_path):
     import io
 
