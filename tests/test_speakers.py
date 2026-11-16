@@ -107,6 +107,10 @@ def test_link_speaker_tree_maps_corpus_layouts_and_rejects_unknown(tmp_path):
     assert summary == {'speakers': 2, 'files': 2}
     assert (tmp_path / 'linked' / 'vctk:p225' / 'p225_001_mic1.flac').is_symlink()
     assert (tmp_path / 'linked' / 'vocalset:female1' / 'f1_a_vibrato.wav').is_symlink()
+    junk = tmp_path / 'vocalset' / '__MACOSX' / 'FULL' / 'female1'
+    junk.mkdir(parents=True)
+    sf.write(junk / '._f1_a_vibrato.wav', np.zeros(400, dtype=np.float32), 8000)
+    assert link_speaker_tree([tmp_path / 'vocalset'], tmp_path / 'junk-ok') == {'speakers': 1, 'files': 1}
     stray = tmp_path / 'vctk' / 'wav48_silence_trimmed' / 'misc'
     stray.mkdir(parents=True)
     sf.write(stray / 'noise.wav', np.zeros(400, dtype=np.float32), 8000)

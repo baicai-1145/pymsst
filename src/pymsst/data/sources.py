@@ -17,6 +17,8 @@ CORPORA = {
 # datashare.ed.ac.uk answers 403 to Colab egress; this HF mirror is the same 48 kHz corpus.
 HF_CORPORA = {"vctk-hf": ("sanchit-gandhi/vctk", "vctk")}
 AUDIO_SUFFIXES = {".wav", ".flac"}
+# macOS zips carry resource forks (__MACOSX/._*); they are audio-suffixed but not audio.
+ARCHIVE_JUNK = {"__MACOSX", ".DS_Store"}
 
 
 def _expected_md5(url):
@@ -139,7 +141,9 @@ def link_speaker_tree(roots, output, *, patterns=None, drop_patterns=None):
     for root in roots:
         root = Path(root).resolve()
         for path in sorted(root.rglob("*")):
-            if path.suffix.lower() not in AUDIO_SUFFIXES or any(p.search(path.name) for p in dropped):
+            if path.suffix.lower() not in AUDIO_SUFFIXES or path.name.startswith("._"):
+                continue
+            if ARCHIVE_JUNK & set(path.relative_to(root).parts) or any(p.search(path.name) for p in dropped):
                 continue
             parts = path.relative_to(root).parts[:-1]
             for depth in range(len(parts) - 1, -1, -1):

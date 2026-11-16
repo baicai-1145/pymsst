@@ -18,10 +18,14 @@ DATA = Path("/content/data")
 CONFIG = WORKSPACE / "pymsst/configs/adaptive_bs_roformer_44k_stereo.yaml"
 
 
-def run(command, log=None):
-    print(json.dumps({"event": "command", "args": [str(part) for part in command[:4]]}), flush=True)
-    with (log.open("w") if log else open(os.devnull, "w")) as handle:
-        subprocess.run([str(part) for part in command], check=True, stdout=handle, stderr=subprocess.STDOUT)
+def run(command, log=None, label="step"):
+    log = Path(log) if log else Path(f"/content/adaptive-step-{label}.log")
+    print(json.dumps({"event": "command", "args": [str(part) for part in command[:4]], "log": str(log)}), flush=True)
+    with log.open("w") as handle:
+        result = subprocess.run([str(part) for part in command], stdout=handle, stderr=subprocess.STDOUT)
+    if result.returncode:
+        tail = [line for line in log.read_text(errors="replace").splitlines() if line.strip()][-12:]
+        raise RuntimeError(f"{' '.join(command[:3])} failed ({result.returncode}): " + " | ".join(tail))
 
 
 def main():
@@ -42,23 +46,26 @@ def main():
 
     install_log = Path("/content/adaptive-install.log")
     # A stale non-editable copy in site-packages shadows the extracted tree; drop it first.
-    run([sys.executable, "-m", "pip", "uninstall", "-y", "pymsst", "pymss-core", "pymss"], install_log)
+    run([sys.executable, "-m", "pip", "uninstall", "-y", "pymsst", "pymss-core", "pymss"], install_log, "uninstall")
     run([sys.executable, "-m", "pip", "install", "-e", WORKSPACE / "pymss-core",
-         "-e", str(WORKSPACE / "pymsst") + "[speakers]", "-e", WORKSPACE / "pymss"], install_log)
+         "-e", str(WORKSPACE / "pymsst") + "[speakers]", "-e", WORKSPACE / "pymss"], install_log, "install")
 
     cli = [sys.executable, "-m", "pymsst"]
     corpora = DATA / "corpora"
-    for name in ("vctk-hf", "vocalset"):
-        run([*cli, "fetch-corpus", "--name", name, "--root", corpora], Path(f"/content/adaptive-fetch-{name}.log"))
-        print(json.dumps({"event": "corpus", "name": name,
-                          "dirs": len([d for d in corpora.iterdir() if d.is_dir()])}), flush=True)
+    for name, marker in (("vctk-hf", corpora / "vctk"), ("vocalset", corpora / "VocalSet")):
+        if marker.is_dir() and any(marker.iterdir()):
+            print(json.dumps({"event": "corpus_cached", "name": name}), flush=True)
+            continue
+        run([*cli, "fetch-corpus", "--name", name, "--root", corpora], label=f"fetch-{name}")
+        print(json.dumps({"event": "corpus", "name": name, "present": marker.is_dir()}), flush=True)
     linked = DATA / "speakers"
-    if not linked.is_dir():
-        # mic2 duplicates mic1; keeping both doubles near-identical audio without adding identity.
-        run([*cli, "link-speakers", "--root", corpora, "--output", linked, "--drop", "mic2"])
+    if linked.exists():
+        shutil.rmtree(linked)
+    # mic2 duplicates mic1; keeping both doubles near-identical audio without adding identity.
+    run([*cli, "link-speakers", "--root", corpora, "--output", linked, "--drop", "mic2"], label="link")
     manifests = DATA / "manifests"
     if not (manifests / "train.jsonl").is_file():
-        run([*cli, "prepare-speakers", "--root", linked, "--output", manifests, "--layout", "speaker-dirs"])
+        run([*cli, "prepare-speakers", "--root", linked, "--output", manifests, "--layout", "speaker-dirs"], label="prepare")
 
     train = [*cli, "train-speakers", "--config", CONFIG,
              "--train-manifest", manifests / "train.jsonl",
