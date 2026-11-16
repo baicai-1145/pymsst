@@ -35,8 +35,8 @@ def main():
     if steps < 20:
         raise ValueError("SPEAKER_STEPS must be at least 20")
     gpu = subprocess.check_output(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"], text=True).strip()
-    if "L4" not in gpu:
-        raise RuntimeError(f"expected the requested L4 runtime, got {gpu}")
+    if not any(name in gpu for name in ("L4", "A100", "H100", "V100", "G4")):
+        raise RuntimeError(f"no supported GPU in this runtime: {gpu}")
     print(json.dumps({"event": "gpu", "gpu": gpu}), flush=True)
 
     install_log = Path("/content/adaptive-install.log")
