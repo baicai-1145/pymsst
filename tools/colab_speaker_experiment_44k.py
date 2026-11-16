@@ -41,6 +41,8 @@ def main():
     print(json.dumps({"event": "gpu", "gpu": gpu}), flush=True)
 
     install_log = Path("/content/adaptive-install.log")
+    # A stale non-editable copy in site-packages shadows the extracted tree; drop it first.
+    run([sys.executable, "-m", "pip", "uninstall", "-y", "pymsst", "pymss-core", "pymss"], install_log)
     run([sys.executable, "-m", "pip", "install", "-e", WORKSPACE / "pymss-core",
          "-e", str(WORKSPACE / "pymsst") + "[speakers]", "-e", WORKSPACE / "pymss"], install_log)
 
