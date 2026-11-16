@@ -166,6 +166,26 @@ def test_hf_parquet_shard_decodes_into_per_speaker_flac(tmp_path):
     assert link_speaker_tree([tmp_path / "out"], tmp_path / "linked") == {"speakers": 2, "files": 2}
 
 
+def test_prepare_manifests_keeps_every_split_non_empty(tmp_path):
+    from pymsst.data.speakers import prepare_manifests
+
+    root = tmp_path / 'speakers'
+    for index in range(40):
+        directory = root / f'spk{index:02d}'
+        directory.mkdir(parents=True)
+        sf.write(directory / 'a.wav', np.ones(8000, dtype=np.float32) * .1, 8000)
+    summary = prepare_manifests(root, tmp_path / 'manifests', layout='speaker-dirs')
+    assert all(part['speakers'] >= 1 for part in summary.values())
+    assert sum(part['speakers'] for part in summary.values()) == 40
+    again = prepare_manifests(root, tmp_path / 'manifests2', layout='speaker-dirs')
+    assert again == summary, 'the identity split must be reproducible'
+    single = tmp_path / 'one' / 'only'
+    single.mkdir(parents=True)
+    sf.write(single / 'a.wav', np.ones(8000, dtype=np.float32) * .1, 8000)
+    with pytest.raises(ValueError, match='at least three identities'):
+        prepare_manifests(tmp_path / 'one', tmp_path / 'one-manifests', layout='speaker-dirs')
+
+
 def test_identity_disjointness_and_insufficient_speakers(tmp_path):
     train, validation = manifest(tmp_path, 'train'), manifest(tmp_path, 'validation')
     validate_disjoint_manifests(train, validation)

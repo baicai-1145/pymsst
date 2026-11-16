@@ -12,15 +12,27 @@ import torch
 from torch.utils.data import Dataset
 
 
+def _ranked_split(speakers, validation_fraction=0.05, test_fraction=0.05):
+    """Hash-rank identities so every split is non-empty and the assignment is reproducible."""
+    ranked = sorted(speakers, key=lambda name: hashlib.sha256(name.encode()).hexdigest())
+    if len(ranked) < 3:
+        raise ValueError(f"need at least three identities for train/validation/test, got {len(ranked)}")
+    n_validation = max(1, round(len(ranked) * validation_fraction))
+    n_test = max(1, round(len(ranked) * test_fraction))
+    while n_validation + n_test >= len(ranked):
+        n_validation, n_test = 1, 1
+    held_out = ranked[:n_validation + n_test]
+    return set(held_out[:n_validation]), set(held_out[n_validation:n_validation + n_test])
+
+
 def prepare_manifests(root, output, *, layout="librispeech"):
-    """LibriSpeech uses its official splits; custom speaker directories use an identity hash."""
+    """LibriSpeech keeps its official splits; speaker directories use a hashed identity ranking."""
     import soundfile as sf
 
     root, output = Path(root).resolve(), Path(output)
     if not root.is_dir() or layout not in {"librispeech", "speaker-dirs"}:
         raise ValueError("a dataset directory and a supported layout are required")
-    rows = {name: [] for name in ("train", "validation", "test")}
-    seen_speakers = {}
+    entries, seen_speakers = [], {}
     for path in sorted(root.rglob("*")):
         if path.suffix.lower() not in {".wav", ".flac"}:
             continue
@@ -34,18 +46,28 @@ def prepare_manifests(root, output, *, layout="librispeech"):
         else:
             if len(parts) < 2:
                 raise ValueError(f"expected root/speaker_id/audio under {root}")
-            speaker = parts[0]
-            bucket = int(hashlib.sha256(speaker.encode()).hexdigest(), 16) % 20
-            split = "validation" if bucket == 0 else "test" if bucket == 1 else "train"
-        if speaker in seen_speakers and seen_speakers[speaker] != split:
+            speaker, split = parts[0], None
+        if split and speaker in seen_speakers and seen_speakers[speaker] != split:
             raise ValueError(f"speaker {speaker} appears in different splits")
-        seen_speakers[speaker] = split
+        if split:
+            seen_speakers[speaker] = split
+        entries.append((path, speaker, split))
+    if layout == "speaker-dirs":
+        validation, test = _ranked_split({speaker for _, speaker, _ in entries})
+        seen_speakers = {speaker: "validation" if speaker in validation else
+                         "test" if speaker in test else "train" for _, speaker, _ in entries}
+    rows = {name: [] for name in ("train", "validation", "test")}
+    for path, speaker, split in entries:
+        split = split or seen_speakers[speaker]
         info = sf.info(path)
         if info.frames < info.samplerate / 4:
             continue
         rows[split].append({"path": str(path), "speaker": speaker, "sample_rate": info.samplerate, "frames": info.frames})
     if not any(rows.values()):
         raise ValueError(f"no usable audio found in {root}")
+    empty = [name for name, items in rows.items() if not items]
+    if empty:
+        raise ValueError(f"identity split left an empty manifest {empty}; the corpus download is probably incomplete")
     output.mkdir(parents=True, exist_ok=True)
     for split, items in rows.items():
         (output / f"{split}.jsonl").write_text("".join(json.dumps(row) + "\n" for row in items))

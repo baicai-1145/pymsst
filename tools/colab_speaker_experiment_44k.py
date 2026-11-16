@@ -68,10 +68,26 @@ def main():
 
     cli = [sys.executable, "-m", "pymsst"]
     corpora = DATA / "corpora"
+    complete = {"vctk-hf": corpora / "vctk" / ".fetch_complete",
+                "vocalset": corpora / ".archives" / "vocalset.extracted"}
     for name, marker in (("vctk-hf", corpora / "vctk"), ("vocalset", corpora / "VocalSet")):
-        if marker.is_dir() and any(marker.iterdir()):
+        if complete[name].exists():
             print(json.dumps({"event": "corpus_cached", "name": name}), flush=True)
             continue
+        # Adopt a tree that is evidently whole, even if an older run never wrote the marker.
+        if marker.is_dir():
+            if name == "vctk-hf":
+                whole = len([d for d in marker.iterdir() if d.is_dir() and d.name.startswith(("p", "s"))]) >= 100
+            else:
+                whole = len(list((marker / "FULL").glob("*"))) >= 20 if (marker / "FULL").is_dir() else False
+            if whole:
+                complete[name].parent.mkdir(parents=True, exist_ok=True)
+                complete[name].write_text("adopted\n")
+                print(json.dumps({"event": "corpus_adopted", "name": name}), flush=True)
+                continue
+            # A killed run leaves a partial tree; rebuild it instead of training on half a corpus.
+            shutil.rmtree(marker, ignore_errors=True)
+            print(json.dumps({"event": "corpus_discarded", "name": name}), flush=True)
         run([*cli, "fetch-corpus", "--name", name, "--root", corpora], label=f"fetch-{name}")
         print(json.dumps({"event": "corpus", "name": name, "present": marker.is_dir()}), flush=True)
     linked = DATA / "speakers"

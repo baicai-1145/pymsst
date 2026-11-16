@@ -65,6 +65,7 @@ def _fetch(args):
     if not args.no_extract:
         extract_archive(archive, args.root)
         archive.unlink()
+        (Path(args.root) / ".archives" / f"{args.name}.extracted").write_text("ok\n")
     print(json.dumps({"corpus": args.name, "root": str(args.root)}))
     return 0
 

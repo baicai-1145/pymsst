@@ -117,8 +117,12 @@ def fetch_hf_corpus(name, root, *, timeout=120):
     root = Path(root).resolve()
     scratch = root / ".archives"
     scratch.mkdir(parents=True, exist_ok=True)
+    done = root / prefix.rstrip("/") / ".shards"
+    done.mkdir(parents=True, exist_ok=True)
     totals, rates = 0, set()
     for number, shard in enumerate(shards, 1):
+        if (done / f"{number:03d}").exists():
+            continue
         local = scratch / f"{name}-{number:03d}.parquet"
         if not local.is_file():
             url = f"https://huggingface.co/datasets/{repo}/resolve/main/{shard}"
@@ -128,8 +132,10 @@ def fetch_hf_corpus(name, root, *, timeout=120):
         totals += summary["written"]
         rates.update(summary["sample_rates"])
         local.unlink()
+        (done / f"{number:03d}").write_text("ok\n")
         print(f"{name}: shard {number}/{len(shards)} decoded, {totals} files total", flush=True)
-    return {"written": totals, "sample_rates": sorted(rates)}
+    (done.parent / ".fetch_complete").write_text(f"{len(shards)} shards\n")
+    return {"written": totals, "shards": len(shards), "sample_rates": sorted(rates)}
 
 
 def link_speaker_tree(roots, output, *, patterns=None, drop_patterns=None):
