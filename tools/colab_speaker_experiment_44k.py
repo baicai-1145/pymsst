@@ -44,6 +44,12 @@ def main():
     run([sys.executable, "-m", "pip", "install", "-e", WORKSPACE / "pymss-core",
          "-e", str(WORKSPACE / "pymsst") + "[speakers]", "-e", WORKSPACE / "pymss"], install_log, "install")
 
+    # Editable installs land in a .pth file, which only takes effect at interpreter start;
+    # this process installed them just now, so expose the sources explicitly.
+    for extra in (WORKSPACE / "pymss-core", WORKSPACE / "pymss", WORKSPACE / "pymsst/src"):
+        if str(extra) not in sys.path:
+            sys.path.insert(0, str(extra))
+
     # Import only after installation: a fresh runtime has no pymsst yet.
     from pymsst.data.sources import HF_CORPORA
 
