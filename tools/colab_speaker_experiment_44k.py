@@ -30,12 +30,6 @@ def run(command, log=None, label="step"):
 
 def main():
     revisions = json.loads((WORKSPACE / "source-revisions.json").read_text())
-    from pymsst.data.sources import HF_CORPORA
-
-    print(json.dumps({"event": "source", "revisions": {k: v[:7] for k, v in revisions.items()},
-                      "hf_corpora": sorted(HF_CORPORA)}), flush=True)
-    if "vctk-hf" not in HF_CORPORA:
-        raise RuntimeError("stale source tree: pymsst.data.sources has no vctk-hf entry")
     steps = int(os.environ.get("SPEAKER_STEPS", "2000"))
     if steps < 20:
         raise ValueError("SPEAKER_STEPS must be at least 20")
@@ -49,6 +43,14 @@ def main():
     run([sys.executable, "-m", "pip", "uninstall", "-y", "pymsst", "pymss-core", "pymss"], install_log, "uninstall")
     run([sys.executable, "-m", "pip", "install", "-e", WORKSPACE / "pymss-core",
          "-e", str(WORKSPACE / "pymsst") + "[speakers]", "-e", WORKSPACE / "pymss"], install_log, "install")
+
+    # Import only after installation: a fresh runtime has no pymsst yet.
+    from pymsst.data.sources import HF_CORPORA
+
+    print(json.dumps({"event": "source", "revisions": {k: v[:7] for k, v in revisions.items()},
+                      "hf_corpora": sorted(HF_CORPORA)}), flush=True)
+    if "vctk-hf" not in HF_CORPORA:
+        raise RuntimeError("stale source tree: pymsst.data.sources has no vctk-hf entry")
 
     cli = [sys.executable, "-m", "pymsst"]
     corpora = DATA / "corpora"
