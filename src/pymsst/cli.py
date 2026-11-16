@@ -17,6 +17,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
 
     subparsers = parser.add_subparsers(dest="command")
+    from .speaker_cli import add_speaker_commands
+    add_speaker_commands(subparsers)
 
     check_musdb = subparsers.add_parser("check-musdb", help="Check a MUSDB18-HQ style dataset layout.")
     check_musdb.add_argument("root", type=Path, help="Dataset root containing train/test split directories.")

@@ -1,0 +1,51 @@
+model_type: adaptive_bs_roformer
+model:
+  dim: 128
+  depth: 4
+  max_speakers: 5
+  decoder_heads: 4
+  memory_frames: 256
+  stereo: false
+  heads: 4
+  dim_head: 32
+  time_transformer_depth: 1
+  freq_transformer_depth: 1
+  attn_dropout: 0.0
+  ff_dropout: 0.0
+  stft_n_fft: 512
+  stft_win_length: 512
+  stft_hop_length: 128
+  freqs_per_bands: [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 8, 8, 8, 8, 8, 8, 8, 8, 16, 16, 16, 16, 16, 16, 16, 17]
+  mask_estimator_depth: 2
+  mlp_expansion_factor: 2
+audio:
+  sample_rate: 16000
+  duration: 4.0
+training:
+  seed: 1145
+  batch_size: 2
+  steps_per_epoch: 500
+  max_steps: 20000
+  lr: 0.0002
+  weight_decay: 0.0001
+  amp: true
+  gradient_clip: 5.0
+  validate_every: 250
+  save_every: 250
+  validation_samples: 24
+  log_every: 10
+augmentation:
+  pitch_probability: 0.2
+  pitch_semitones: 2.0
+  eq_probability: 0.6
+  eq_db: 6.0
+  reverb_probability: 0.4
+  max_rt60: 0.6
+  noise_probability: 0.5
+  min_active_fraction: 0.5
+  empty_weight: 0.15
+loss:
+  fft_sizes: [256, 512, 1024]
+  spectral_weight: 0.5
+  existence_weight: 1.0
+  silence_weight: 0.1

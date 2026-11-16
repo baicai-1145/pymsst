@@ -6,6 +6,8 @@ from pathlib import Path
 import pytest
 
 
+ROOT = Path(__file__).resolve().parents[1]
+
 FORBIDDEN_DEFAULT_DEPENDENCIES = {
     "accelerate",
     "av",
@@ -26,7 +28,7 @@ def _dependency_name(requirement: str) -> str:
 
 def test_default_dependencies_stay_minimal_and_audio_extras_are_optional():
     tomllib = pytest.importorskip("tomllib")
-    pyproject = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+    pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
     default_dependencies = {
         _dependency_name(requirement)
@@ -39,11 +41,16 @@ def test_default_dependencies_stay_minimal_and_audio_extras_are_optional():
 
     assert default_dependencies.isdisjoint(FORBIDDEN_DEFAULT_DEPENDENCIES)
     assert optional_av_dependencies == {"av"}
+    speaker_dependencies = {
+        _dependency_name(requirement)
+        for requirement in pyproject["project"]["optional-dependencies"]["speakers"]
+    }
+    assert speaker_dependencies == {"soundfile", "scipy", "librosa"}
 
 
 def test_pymss_core_is_resolved_from_package_index_not_local_editable():
     tomllib = pytest.importorskip("tomllib")
-    pyproject = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+    pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
     uv_sources = pyproject.get("tool", {}).get("uv", {}).get("sources", {})
 
@@ -51,15 +58,33 @@ def test_pymss_core_is_resolved_from_package_index_not_local_editable():
     assert "pymss-core>=0.1.4" in pyproject["project"]["dependencies"]
 
 
-def test_pymsst_source_does_not_import_optional_audio_or_logging_dependencies():
+def test_optional_dependencies_are_confined_to_lazy_speaker_feature_imports():
     forbidden_imports = FORBIDDEN_DEFAULT_DEPENDENCIES | {"pyav"}
-    imported: set[str] = set()
-    for path in sorted(Path("src/pymsst").rglob("*.py")):
+    allowed = {"data/speakers.py": {"soundfile", "librosa"}}
+    source = ROOT / "src/pymsst"
+    for path in sorted(source.rglob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
         for node in ast.walk(tree):
+            names = set()
             if isinstance(node, ast.Import):
-                imported.update(alias.name.split(".", 1)[0].lower().replace("_", "-") for alias in node.names)
+                names = {alias.name.split(".", 1)[0].lower().replace("_", "-") for alias in node.names}
             elif isinstance(node, ast.ImportFrom) and node.module:
-                imported.add(node.module.split(".", 1)[0].lower().replace("_", "-"))
+                names = {node.module.split(".", 1)[0].lower().replace("_", "-")}
+            optional = names & forbidden_imports
+            if not optional:
+                continue
+            assert optional <= allowed.get(path.relative_to(source).as_posix(), set()), path
+            ancestor = parents.get(node)
+            while ancestor is not None and not isinstance(ancestor, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                ancestor = parents.get(ancestor)
+            assert ancestor is not None, f"optional import must be inside a function: {path}"
 
-    assert imported.isdisjoint(forbidden_imports)
+
+def test_cli_loads_when_speaker_audio_extras_are_unavailable():
+    import subprocess
+    import sys
+
+    code = ("import sys; sys.modules.update({'soundfile': None, 'librosa': None}); "
+            "from pymsst.cli import build_parser; build_parser()")
+    subprocess.run([sys.executable, "-c", code], cwd=ROOT, check=True, capture_output=True, text=True)
