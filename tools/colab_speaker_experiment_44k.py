@@ -110,6 +110,13 @@ def main():
              "--train-manifest", manifests / "train.jsonl",
              "--validation-manifest", manifests / "validation.jsonl",
              "--run-dir", RUN, "--device", "cuda", "--num-workers", "8"]
+    # A reclaimed runtime loses RUN; continue from the checkpoint the orchestrator re-uploads.
+    seed = Path("/content/adaptive-seed-checkpoint.pt")
+    if seed.is_file() and not (RUN / "last.pt").exists():
+        RUN.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(seed, RUN / "last.pt")
+        print(json.dumps({"event": "resumed_from_uploaded_checkpoint",
+                          "step": torch.load(seed, map_location="cpu", weights_only=True)["step"]}), flush=True)
     # Fill the card: start big and step down only if the allocator refuses.
     wanted = int(os.environ.get("SPEAKER_BATCH", "8"))
     candidates = [wanted] + [size for size in (8, 4, 2, 1) if size < wanted]
