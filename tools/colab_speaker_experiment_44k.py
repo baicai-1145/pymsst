@@ -20,11 +20,18 @@ CONFIG = WORKSPACE / "pymsst/configs/adaptive_bs_roformer_44k_stereo.yaml"
 
 def run(command, log=None):
     print(json.dumps({"event": "command", "args": [str(part) for part in command[:4]]}), flush=True)
-    with (log.open("a") if log else open(os.devnull, "w")) as handle:
+    with (log.open("w") if log else open(os.devnull, "w")) as handle:
         subprocess.run([str(part) for part in command], check=True, stdout=handle, stderr=subprocess.STDOUT)
 
 
 def main():
+    revisions = json.loads((WORKSPACE / "source-revisions.json").read_text())
+    from pymsst.data.sources import HF_CORPORA
+
+    print(json.dumps({"event": "source", "revisions": {k: v[:7] for k, v in revisions.items()},
+                      "hf_corpora": sorted(HF_CORPORA)}), flush=True)
+    if "vctk-hf" not in HF_CORPORA:
+        raise RuntimeError("stale source tree: pymsst.data.sources has no vctk-hf entry")
     steps = int(os.environ.get("SPEAKER_STEPS", "2000"))
     if steps < 20:
         raise ValueError("SPEAKER_STEPS must be at least 20")
@@ -40,7 +47,9 @@ def main():
     cli = [sys.executable, "-m", "pymsst"]
     corpora = DATA / "corpora"
     for name in ("vctk-hf", "vocalset"):
-        run([*cli, "fetch-corpus", "--name", name, "--root", corpora], Path("/content/adaptive-fetch.log"))
+        run([*cli, "fetch-corpus", "--name", name, "--root", corpora], Path(f"/content/adaptive-fetch-{name}.log"))
+        print(json.dumps({"event": "corpus", "name": name,
+                          "dirs": len([d for d in corpora.iterdir() if d.is_dir()])}), flush=True)
     linked = DATA / "speakers"
     if not linked.is_dir():
         # mic2 duplicates mic1; keeping both doubles near-identical audio without adding identity.
