@@ -96,8 +96,14 @@ def main():
     # mic2 duplicates mic1; keeping both doubles near-identical audio without adding identity.
     run([*cli, "link-speakers", "--root", corpora, "--output", linked, "--drop", "mic2"], label="link")
     manifests = DATA / "manifests"
-    if not (manifests / "train.jsonl").is_file():
-        run([*cli, "prepare-speakers", "--root", linked, "--output", manifests, "--layout", "speaker-dirs"], label="prepare")
+    # Always rebuild: a manifest left over from a partial corpus silently skips identities.
+    if manifests.exists():
+        shutil.rmtree(manifests)
+    run([*cli, "prepare-speakers", "--root", linked, "--output", manifests, "--layout", "speaker-dirs"], label="prepare")
+    summary = json.loads((manifests / "summary.json").read_text())
+    print(json.dumps({"event": "manifests", **summary}), flush=True)
+    if any(part["speakers"] < 1 for part in summary.values()):
+        raise RuntimeError(f"a split has no identities: {summary}")
 
     train = [*cli, "train-speakers", "--config", CONFIG,
              "--train-manifest", manifests / "train.jsonl",
