@@ -5,7 +5,6 @@ from pathlib import Path
 
 import pytest
 
-
 ROOT = Path(__file__).resolve().parents[1]
 
 FORBIDDEN_DEFAULT_DEPENDENCIES = {
@@ -45,7 +44,7 @@ def test_default_dependencies_stay_minimal_and_audio_extras_are_optional():
         _dependency_name(requirement)
         for requirement in pyproject["project"]["optional-dependencies"]["speakers"]
     }
-    assert speaker_dependencies == {"soundfile", "scipy", "librosa"}
+    assert speaker_dependencies == {"soundfile", "scipy", "librosa", "pyarrow"}
 
 
 def test_pymss_core_is_resolved_from_package_index_not_local_editable():
@@ -60,7 +59,7 @@ def test_pymss_core_is_resolved_from_package_index_not_local_editable():
 
 def test_optional_dependencies_are_confined_to_lazy_speaker_feature_imports():
     forbidden_imports = FORBIDDEN_DEFAULT_DEPENDENCIES | {"pyav"}
-    allowed = {"data/speakers.py": {"soundfile", "librosa"}}
+    allowed = {"data/speakers.py": {"soundfile", "librosa"}, "data/sources.py": {"soundfile"}}
     source = ROOT / "src/pymsst"
     for path in sorted(source.rglob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))

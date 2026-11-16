@@ -13,9 +13,8 @@ from pymss_core import to_plain
 
 from pymsst import __version__
 from pymsst.data.datamodule import MusdbDataModule
-from pymsst.training.cuda_graph import RoformerMaskCoreCudaGraph
 from pymsst.training import SeparationLightningModule, compute_loss
-
+from pymsst.training.cuda_graph import RoformerMaskCoreCudaGraph
 
 LOSS_CURVE_FIELDS = ("event", "global_step", "epoch", "batch_idx", "loss", "val_loss", "val_sdr")
 

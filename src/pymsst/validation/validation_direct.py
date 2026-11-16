@@ -151,8 +151,8 @@ def _run_original_validation(
     _seed_everything(seed)
     if str(original_root) not in sys.path:
         sys.path.insert(0, str(original_root))
-    from utils.settings import get_model_from_config
     from utils.model_utils import load_start_checkpoint
+    from utils.settings import get_model_from_config
 
     model, config = get_model_from_config(model_type, str(config_path))
     _apply_overrides(config, steps=1, batch_size=batch_size, chunk_size=chunk_size)
@@ -193,8 +193,8 @@ def _run_validation(
 ) -> dict[str, Any]:
     if str(original_root) not in sys.path:
         sys.path.insert(0, str(original_root))
-    from valid import valid
     import utils.metrics as original_metrics
+    from valid import valid
 
     original_sdr = original_metrics.sdr
 

@@ -114,6 +114,29 @@ def test_link_speaker_tree_maps_corpus_layouts_and_rejects_unknown(tmp_path):
         link_speaker_tree([tmp_path / 'vctk'], tmp_path / 'again', drop_patterns=['mic2'])
 
 
+def test_hf_parquet_shard_decodes_into_per_speaker_flac(tmp_path):
+    import io
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from pymsst.data.sources import extract_parquet_audio, link_speaker_tree
+
+    rows = []
+    for speaker, value in (("p225", .1), ("p226", .2)):
+        buffer = io.BytesIO()
+        sf.write(buffer, np.full(2400, value, dtype=np.float32), 48000, format="FLAC")
+        rows.append({"speaker_id": speaker, "audio": {"bytes": buffer.getvalue(), "path": None}})
+    shard = tmp_path / "shard.parquet"
+    pq.write_table(pa.Table.from_pylist(rows), shard)
+    summary = extract_parquet_audio(shard, tmp_path / "out", prefix="vctk/")
+    assert summary == {"written": 2, "sample_rates": [48000]}
+    files = sorted((tmp_path / "out").rglob("*.flac"))
+    assert [f.parent.name for f in files] == ["p225", "p226"]
+    assert sf.info(files[0]).samplerate == 48000
+    assert link_speaker_tree([tmp_path / "out"], tmp_path / "linked") == {"speakers": 2, "files": 2}
+
+
 def test_identity_disjointness_and_insufficient_speakers(tmp_path):
     train, validation = manifest(tmp_path, 'train'), manifest(tmp_path, 'validation')
     validate_disjoint_manifests(train, validation)

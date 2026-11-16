@@ -16,7 +16,6 @@ from .fused_roformer import (
 )
 from .losses import compute_loss, signal_to_distortion_ratio
 
-
 DEFAULT_TRAIN_CUDA_ATTENTION_BACKEND = "default"
 RUNTIME_OPTIMIZATION_PRESETS = {"off", "train_fragmentation", "high_util"}
 TRAIN_FRAGMENTATION_ENV = {

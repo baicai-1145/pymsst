@@ -72,6 +72,62 @@ def extract_archive(archive, root):
     return root
 
 
+def extract_parquet_audio(source, output, *, speaker_key="speaker_id", prefix=""):
+    """Decode the audio bytes of one HF audio shard into <output>/<prefix><speaker>/<name>.flac."""
+    import io
+
+    import pyarrow.parquet as pq
+    import soundfile as sf
+
+    output = Path(output)
+    shard = pq.ParquetFile(source)
+    written, rates = 0, set()
+    for batch in shard.iter_batches(batch_size=256, columns=[speaker_key, "audio"]):
+        speakers = batch.column(0).to_pylist()
+        encoded = batch.column(1).to_pylist()
+        for speaker, item in zip(speakers, encoded):
+            payload = item.get("bytes") if isinstance(item, dict) else item
+            if not payload:
+                continue
+            samples, rate = sf.read(io.BytesIO(payload), dtype="float32", always_2d=True)
+            rates.add(rate)
+            directory = output / f"{prefix}{speaker}"
+            directory.mkdir(parents=True, exist_ok=True)
+            sf.write(directory / f"{speaker}_{written:06d}.flac", samples, rate, format="FLAC")
+            written += 1
+    return {"written": written, "sample_rates": sorted(rates)}
+
+
+def fetch_hf_corpus(name, root, *, timeout=120):
+    """Download and decode an HF-hosted audio corpus one shard at a time, deleting each shard after use."""
+    if name not in HF_CORPORA:
+        raise ValueError(f"unknown HF corpus {name!r}; known: {', '.join(sorted(HF_CORPORA))}")
+    import urllib.request
+
+    repo, prefix = HF_CORPORA[name]
+    with urllib.request.urlopen(f"https://huggingface.co/api/datasets/{repo}/tree/main?recursive=true", timeout=timeout) as response:
+        listing = json.load(response)
+    shards = sorted(item["path"] for item in listing if item.get("type") == "file" and item["path"].endswith(".parquet"))
+    if not shards:
+        raise ValueError(f"{repo} has no parquet shards")
+    root = Path(root).resolve()
+    scratch = root / ".archives"
+    scratch.mkdir(parents=True, exist_ok=True)
+    totals, rates = 0, set()
+    for number, shard in enumerate(shards, 1):
+        local = scratch / f"{name}-{number:03d}.parquet"
+        if not local.is_file():
+            url = f"https://huggingface.co/datasets/{repo}/resolve/main/{shard}"
+            with urllib.request.urlopen(url, timeout=timeout) as response, local.open("wb") as handle:
+                shutil.copyfileobj(response, handle, length=8 * 1024 * 1024)
+        summary = extract_parquet_audio(local, root, prefix=prefix + "/")
+        totals += summary["written"]
+        rates.update(summary["sample_rates"])
+        local.unlink()
+        print(f"{name}: shard {number}/{len(shards)} decoded, {totals} files total", flush=True)
+    return {"written": totals, "sample_rates": sorted(rates)}
+
+
 def link_speaker_tree(roots, output, *, patterns=None, drop_patterns=None):
     """Link every audio file into output/<corpus>:<speaker>/<name>, refusing silent identity loss."""
     output = Path(output).resolve()

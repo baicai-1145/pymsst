@@ -18,7 +18,7 @@ def add_speaker_commands(subparsers):
     prepare.set_defaults(func=_prepare)
 
     fetch = subparsers.add_parser("fetch-corpus", help="Download and extract a known single-speaker corpus.")
-    fetch.add_argument("--name", required=True, choices=("vctk", "vocalset"))
+    fetch.add_argument("--name", required=True, choices=("vctk", "vctk-hf", "vocalset"))
     fetch.add_argument("--root", type=Path, required=True)
     fetch.add_argument("--no-extract", action="store_true")
     fetch.set_defaults(func=_fetch)
@@ -55,8 +55,11 @@ def _prepare(args):
 
 
 def _fetch(args):
-    from .data.sources import download_archive, extract_archive
+    from .data.sources import HF_CORPORA, download_archive, extract_archive, fetch_hf_corpus
 
+    if args.name in HF_CORPORA:
+        print(json.dumps(fetch_hf_corpus(args.name, args.root)))
+        return 0
     archive = download_archive(args.name, args.root)
     if not args.no_extract:
         extract_archive(archive, args.root)

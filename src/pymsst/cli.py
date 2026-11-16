@@ -197,9 +197,9 @@ def _check_musdb(args: argparse.Namespace) -> int:
 def _train(args: argparse.Namespace) -> int:
     import pytorch_lightning as pl
     import torch
+    from pymss_core import to_plain
     from pytorch_lightning.callbacks import ModelCheckpoint
     from pytorch_lightning.loggers import CSVLogger, TensorBoardLogger
-    from pymss_core import to_plain
 
     from .data.datamodule import MusdbDataModule
     from .export import export_core_checkpoint

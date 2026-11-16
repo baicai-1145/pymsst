@@ -13,7 +13,6 @@ import torch
 import yaml
 from pymss_core import load_config, to_plain
 
-
 DEFAULT_ORIGINAL_ROOT = Path("/root/Music-Source-Separation-Training")
 DEFAULT_DATA_ROOT = Path("/root/pymsst/musdb18hq")
 DEFAULT_SCRATCH_CONFIGS = {

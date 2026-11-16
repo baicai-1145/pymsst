@@ -39,7 +39,7 @@ def main():
 
     cli = [sys.executable, "-m", "pymsst"]
     corpora = DATA / "corpora"
-    for name in ("vctk", "vocalset"):
+    for name in ("vctk-hf", "vocalset"):
         run([*cli, "fetch-corpus", "--name", name, "--root", corpora], Path("/content/adaptive-fetch.log"))
     linked = DATA / "speakers"
     if not linked.is_dir():
