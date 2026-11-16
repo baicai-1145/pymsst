@@ -18,7 +18,8 @@ import torch
 WORKSPACE = Path("/content/adaptive-speakers")
 RUN = Path("/content/runs/adaptive-44k-stereo")
 DATA = Path("/content/data")
-CONFIG = WORKSPACE / "pymsst/configs/adaptive_bs_roformer_44k_stereo.yaml"
+CONFIG = Path(os.environ.get("SPEAKER_CONFIG",
+                             str(WORKSPACE / "pymsst/configs/adaptive_bs_roformer_44k_stereo.yaml")))
 
 
 def run(command, log=None, label="step"):

@@ -93,7 +93,8 @@ def test_shipped_44k_stereo_configs_build_and_forward():
     from pymss_core import get_model_from_config
 
     root = Path(__file__).resolve().parents[1] / 'configs'
-    for name in ('adaptive_bs_roformer_44k_stereo.yaml', 'adaptive_mel_band_roformer_44k_stereo.yaml'):
+    for name in ('adaptive_bs_roformer_44k_stereo.yaml', 'adaptive_bs_roformer_44k_stereo_large.yaml',
+                 'adaptive_mel_band_roformer_44k_stereo.yaml'):
         model, config = get_model_from_config('auto', root / name)
         assert model.audio_channels == 2 and int(config.audio.sample_rate) == 44100
         model.eval()
