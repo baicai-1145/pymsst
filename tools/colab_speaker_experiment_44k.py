@@ -39,16 +39,21 @@ def main():
     print(json.dumps({"event": "gpu", "gpu": gpu}), flush=True)
 
     install_log = Path("/content/adaptive-install.log")
-    # A stale non-editable copy in site-packages shadows the extracted tree; drop it first.
-    run([sys.executable, "-m", "pip", "uninstall", "-y", "pymsst", "pymss-core", "pymss"], install_log, "uninstall")
-    run([sys.executable, "-m", "pip", "install", "-e", WORKSPACE / "pymss-core",
-         "-e", str(WORKSPACE / "pymsst") + "[speakers]", "-e", WORKSPACE / "pymss"], install_log, "install")
-
-    # Editable installs land in a .pth file, which only takes effect at interpreter start;
-    # this process installed them just now, so expose the sources explicitly.
     for extra in (WORKSPACE / "pymss-core", WORKSPACE / "pymss", WORKSPACE / "pymsst/src"):
         if str(extra) not in sys.path:
             sys.path.insert(0, str(extra))
+    needed = ("torch", "pytorch_lightning", "soundfile", "librosa", "scipy", "pyarrow", "yaml")
+    missing = []
+    for module in needed:
+        try:
+            __import__(module)
+        except Exception:
+            missing.append(module)
+    print(json.dumps({"event": "deps", "missing": missing}), flush=True)
+    if missing:
+        run([sys.executable, "-m", "pip", "uninstall", "-y", "pymsst", "pymss-core", "pymss"], install_log, "uninstall")
+        run([sys.executable, "-m", "pip", "install", "-e", WORKSPACE / "pymss-core",
+             "-e", str(WORKSPACE / "pymsst") + "[speakers]", "-e", WORKSPACE / "pymss"], install_log, "install")
 
     # Import only after installation: a fresh runtime has no pymsst yet.
     from pymsst.data.sources import HF_CORPORA

@@ -137,10 +137,13 @@ def link_speaker_tree(roots, output, *, patterns=None, drop_patterns=None):
     output = Path(output).resolve()
     patterns = patterns or {name: spec[2] for name, spec in CORPORA.items()}
     dropped = [re.compile(p) for p in (drop_patterns or [])]
-    counts, seen = {}, {}
+    counts, seen, scanned = {}, {}, 0
     for root in roots:
         root = Path(root).resolve()
         for path in sorted(root.rglob("*")):
+            scanned += 1
+            if scanned % 20000 == 0:
+                print(f"scanned {scanned} files, linked {sum(counts.values())}", flush=True)
             if path.suffix.lower() not in AUDIO_SUFFIXES or path.name.startswith("._"):
                 continue
             if ARCHIVE_JUNK & set(path.relative_to(root).parts) or any(p.search(path.name) for p in dropped):
