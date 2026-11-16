@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from argparse import Namespace
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -59,6 +60,58 @@ def test_augmentations_preserve_target_mix_alignment(tmp_path):
     dataset.options['noise_probability'] = 1.
     mixture, target, _ = dataset[3]
     assert (mixture - target.sum(0)).square().mean() > 0
+
+
+def test_stereo_mixtures_place_speakers_in_a_stereo_field(tmp_path):
+    source = manifest(tmp_path, 'train')
+    dataset = SpeakerMixtureDataset(source, sample_rate=8000, duration=.1, max_speakers=5, samples_per_epoch=6,
+                                    validation=True, channels=2,
+                                    augmentation={'reverb_probability': 1., 'noise_probability': 0., 'eq_probability': 0., 'pitch_probability': 0.})
+    for index in range(6):
+        mixture, target, count = dataset[index]
+        assert mixture.shape == (2, 800) and target.shape == (5, 2, 800)
+        assert torch.allclose(mixture, target.sum(0), atol=1e-6)
+        if int(count):
+            active = target[:int(count)]
+            assert active.std(dim=-1).min() > 0, 'room response must differ between channels'
+            assert not torch.allclose(active[:, 0], active[:, 1])
+        assert torch.count_nonzero(target[int(count):]) == 0
+
+
+def test_shipped_44k_stereo_configs_build_and_forward():
+    from pymss_core import get_model_from_config
+
+    root = Path(__file__).resolve().parents[1] / 'configs'
+    for name in ('adaptive_bs_roformer_44k_stereo.yaml', 'adaptive_mel_band_roformer_44k_stereo.yaml'):
+        model, config = get_model_from_config('auto', root / name)
+        assert model.audio_channels == 2 and int(config.audio.sample_rate) == 44100
+        model.eval()
+        with torch.inference_mode():
+            output = model(torch.randn(1, 2, 11025))
+        assert output.audio.shape == (1, 5, 2, 11025)
+        assert output.existence_logits.shape == (1, 6)
+        assert torch.isfinite(output.audio).all()
+
+
+def test_link_speaker_tree_maps_corpus_layouts_and_rejects_unknown(tmp_path):
+    from pymsst.data.sources import link_speaker_tree
+
+    vctk = tmp_path / 'vctk' / 'wav48_silence_trimmed' / 'p225'
+    vctk.mkdir(parents=True)
+    sf.write(vctk / 'p225_001_mic1.flac', np.ones(400, dtype=np.float32) * .1, 8000)
+    sf.write(vctk / 'p225_001_mic2.flac', np.ones(400, dtype=np.float32) * .1, 8000)
+    vocal = tmp_path / 'vocalset' / 'FULL' / 'female1' / 'vibrato'
+    vocal.mkdir(parents=True)
+    sf.write(vocal / 'f1_a_vibrato.wav', np.ones(400, dtype=np.float32) * .1, 8000)
+    summary = link_speaker_tree([tmp_path / 'vctk', tmp_path / 'vocalset'], tmp_path / 'linked', drop_patterns=['mic2'])
+    assert summary == {'speakers': 2, 'files': 2}
+    assert (tmp_path / 'linked' / 'vctk:p225' / 'p225_001_mic1.flac').is_symlink()
+    assert (tmp_path / 'linked' / 'vocalset:female1' / 'f1_a_vibrato.wav').is_symlink()
+    stray = tmp_path / 'vctk' / 'wav48_silence_trimmed' / 'misc'
+    stray.mkdir(parents=True)
+    sf.write(stray / 'noise.wav', np.zeros(400, dtype=np.float32), 8000)
+    with pytest.raises(ValueError, match='no speaker directory'):
+        link_speaker_tree([tmp_path / 'vctk'], tmp_path / 'again', drop_patterns=['mic2'])
 
 
 def test_identity_disjointness_and_insufficient_speakers(tmp_path):

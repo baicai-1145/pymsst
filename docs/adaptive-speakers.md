@@ -1,5 +1,31 @@
 # Unknown-count speaker separation on L4
 
+Two recipes ship here. The intended one trains **44.1 kHz stereo** on speech and singing identities:
+
+```bash
+python -m pip install -e ../pymss-core -e ".[speakers]"
+python -m pymsst fetch-corpus --name vctk --root /content/data/corpora
+python -m pymsst fetch-corpus --name vocalset --root /content/data/corpora
+python -m pymsst link-speakers --root /content/data/corpora --output /content/data/speakers --drop mic2
+python -m pymsst prepare-speakers --root /content/data/speakers --layout speaker-dirs \
+  --output /content/data/manifests
+python -m pymsst train-speakers \
+  --config configs/adaptive_bs_roformer_44k_stereo.yaml \
+  --train-manifest /content/data/manifests/train.jsonl \
+  --validation-manifest /content/data/manifests/validation.jsonl \
+  --run-dir /content/runs/adaptive-44k --device cuda --num-workers 4
+```
+
+`fetch-corpus` downloads checksum-verified archives and extracts them. `link-speakers` builds `<corpus>:<speaker>/<file>` symlinks, matching VCTK `pNNN` and VocalSet `maleNN`/`femaleNN` directory names; it fails loudly on audio it cannot attribute to an identity, rather than silently training on unlabeled data. `--drop mic2` keeps one of the two VCTK microphones. Point `--root` at the extracted tree only: VCTK ships `wav48/` and `wav48_silence_trimmed/` with the same utterances, and using both doubles near-identical audio.
+
+Data rates and licenses (verify before redistribution): VCTK 48 kHz, 109 speakers, CC BY 4.0; VocalSet 44.1 kHz, 20 singers, CC BY 4.0; MUSDB18-HQ 44.1 kHz stereo, 150 tracks, **non-commercial**; EARS 48 kHz, ~107 speakers, CC-NC. Weights trained on non-commercial corpora inherit those restrictions: the code is MIT, the weights are not automatically commercially usable. Document the exact corpus list in any released model card.
+
+Stereo targets are spatialized from mono source recordings: constant-power pan, up to 0.7 ms inter-ear delay, and a decorrelated room tail per channel. That is a physically plausible mixing model, not a real binaural recording, and the evaluation inherits that bias. Replace it with measured RIRs before claiming real-room robustness.
+
+`configs/adaptive_bs_roformer_l4.yaml` and `configs/adaptive_mel_band_roformer_l4.yaml` remain the 16 kHz mono recipe used for quick smoke tests.
+
+## Shared behaviour
+
 Use the `feat/adaptive-speaker-roformer` branches of baicai-1145/pymss-core, pymsst and pymss in sibling directories. Install the source core together with the training package; released core packages do not contain these experimental architectures.
 
 ```bash

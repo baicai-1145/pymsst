@@ -59,8 +59,8 @@ def train_speakers(args):
         device_name = "cuda" if torch.cuda.is_available() else "cpu"
     device = torch.device(device_name)
     model, _ = get_model_from_config("auto", args.config)
-    if model.audio_channels != 1:
-        raise ValueError("the current speech mixture pipeline trains mono models")
+    if int(audio.get("channels", model.audio_channels)) != model.audio_channels:
+        raise ValueError("audio.channels must match the model stereo setting")
     model.to(device)
     maximum = model.max_speakers
     batch_size = int(settings.get("batch_size", 2))
@@ -75,7 +75,8 @@ def train_speakers(args):
         raise ValueError("num_workers cannot be negative")
     validate_disjoint_manifests(args.train_manifest, args.validation_manifest)
     common = {"sample_rate": audio["sample_rate"], "duration": audio["duration"], "max_speakers": maximum,
-                  "augmentation": config.get("augmentation", {}), "noise_root": args.noise_root}
+                  "augmentation": config.get("augmentation", {}), "noise_root": args.noise_root,
+                  "channels": model.audio_channels}
     train = SpeakerMixtureDataset(args.train_manifest, samples_per_epoch=steps_per_epoch * batch_size, seed=seed, **common)
     validation = SpeakerMixtureDataset(args.validation_manifest, samples_per_epoch=val_samples,
                                        seed=seed + 1000000, validation=True, **common)
