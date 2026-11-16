@@ -114,7 +114,7 @@ def _download_shard(url, target, timeout):
     return target
 
 
-def fetch_hf_corpus(name, root, *, timeout=120, downloads=4, max_shards=None):
+def fetch_hf_corpus(name, root, *, timeout=120, downloads=8, max_shards=None):
     """Download and decode an HF audio corpus, fetching several shards at once."""
     if name not in HF_CORPORA:
         raise ValueError(f"unknown HF corpus {name!r}; known: {', '.join(sorted(HF_CORPORA))}")

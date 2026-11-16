@@ -86,10 +86,15 @@ def main():
                 complete[name].write_text("adopted\n")
                 print(json.dumps({"event": "corpus_adopted", "name": name}), flush=True)
                 continue
-            # A killed run leaves a partial tree; rebuild it instead of training on half a corpus.
+            # Resumable only when shard markers prove what is already decoded.
+            if name == "vctk-hf" and (marker / ".shards").is_dir():
+                print(json.dumps({"event": "corpus_resuming", "name": name,
+                                  "shards_done": len(list((marker / ".shards").iterdir()))}), flush=True)
+                continue
             shutil.rmtree(marker, ignore_errors=True)
             print(json.dumps({"event": "corpus_discarded", "name": name}), flush=True)
-        run([*cli, "fetch-corpus", "--name", name, "--root", corpora], label=f"fetch-{name}")
+        run([*cli, "fetch-corpus", "--name", name, "--root", corpora], label=f"fetch-{name}",
+            )
         print(json.dumps({"event": "corpus", "name": name, "present": marker.is_dir()}), flush=True)
     linked = DATA / "speakers"
     if linked.exists():
