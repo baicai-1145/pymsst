@@ -109,6 +109,13 @@ def main():
                                  augmentation=dict(config.augmentation), channels=model.audio_channels)
     metrics = evaluate_speakers(model, test, torch.device("cuda"), dict(config.loss))
     (RUN / "test_metrics.json").write_text(json.dumps(metrics, indent=2) + "\n")
+    # Separation ability and robustness to pitch/EQ/reverb/noise are different claims; report both.
+    clean = SpeakerMixtureDataset(manifests / "test.jsonl", sample_rate=config.audio.sample_rate,
+                                  duration=config.audio.duration, max_speakers=model.max_speakers,
+                                  samples_per_epoch=48, validation=True, seed=20261145, augment=False,
+                                  augmentation=dict(config.augmentation), channels=model.audio_channels)
+    clean_metrics = evaluate_speakers(model, clean, torch.device("cuda"), dict(config.loss))
+    (RUN / "test_metrics_clean.json").write_text(json.dumps(clean_metrics, indent=2) + "\n")
     examples = RUN / "examples"
     examples.mkdir(exist_ok=True)
     summaries = []

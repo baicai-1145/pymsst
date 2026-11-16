@@ -62,6 +62,17 @@ def test_augmentations_preserve_target_mix_alignment(tmp_path):
     assert (mixture - target.sum(0)).square().mean() > 0
 
 
+def test_unaugmented_mixture_is_exactly_the_sum_of_targets(tmp_path):
+    source = manifest(tmp_path, 'train')
+    dataset = SpeakerMixtureDataset(source, sample_rate=8000, duration=.1, max_speakers=5, samples_per_epoch=6,
+                                    validation=True, augment=False, noise_root=None,
+                                    augmentation={'noise_probability': 1.})
+    for index in range(6):
+        mixture, target, count = dataset[index]
+        assert torch.allclose(mixture, target.sum(0), atol=1e-7), 'no noise may leak into a clean mixture'
+        assert torch.count_nonzero(target[int(count):]) == 0
+
+
 def test_stereo_mixtures_place_speakers_in_a_stereo_field(tmp_path):
     source = manifest(tmp_path, 'train')
     dataset = SpeakerMixtureDataset(source, sample_rate=8000, duration=.1, max_speakers=5, samples_per_epoch=6,
