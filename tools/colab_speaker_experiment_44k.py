@@ -125,7 +125,7 @@ def main():
     # Fill the card: start big and step down only if the allocator refuses.
     wanted = int(os.environ.get("SPEAKER_BATCH", "8"))
     candidates = [wanted] + [size for size in (8, 4, 2, 1) if size < wanted]
-    batch = None
+    batch = wanted if (RUN / "last.pt").exists() else None  # a resumed run keeps the proven batch
     if not (RUN / "last.pt").exists():
         for size in candidates:
             try:
