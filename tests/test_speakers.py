@@ -122,19 +122,18 @@ def test_extract_parquet_audio_reads_struct_speakers_and_mp3(tmp_path):
     shard = tmp_path / 'shard.parquet'
     table = pa.table({
         'speaker': pa.array(['EN_abc_SPEAKER_00', 'EN_abc_SPEAKER_01']),
-        'mp3': pa.array([{'bytes': encoded(220)}, {'bytes': encoded(330)}],
-                        type=pa.struct([('bytes', pa.binary())])),
+        'audio': pa.array([{'bytes': encoded(220)}, {'bytes': encoded(330)}],
+                          type=pa.struct([('bytes', pa.binary())])),
     })
     pq.write_table(table, shard)
 
     fields = HF_SHARD_FIELDS['emilia-yodas-en']
     summary = extract_parquet_audio(shard, tmp_path / 'out', speaker_key=fields['speaker'],
-                                    audio_key=fields['audio'], prefix='emilia-yodas-en/', raw_suffix='mp3')
-    assert summary['written'] == 2 and summary['sample_rates'] == []
-    written = sorted((tmp_path / 'out').rglob('*.mp3'))
-    # compressed sources are stored as-is so the corpus fits on a Colab disk
+                                    audio_key=fields['audio'], prefix='emilia-yodas-en/')
+    assert summary['written'] == 2 and summary['sample_rates'] == [16000]
+    written = sorted((tmp_path / 'out').rglob('*.flac'))
     assert [path.parent.name for path in written] == ['EN_abc_SPEAKER_00', 'EN_abc_SPEAKER_01']
-    assert written[0].read_bytes() == encoded(220)
+    assert sf.info(written[0]).samplerate == 16000
 
 
 def test_link_speaker_tree_maps_corpus_layouts_and_rejects_unknown(tmp_path):
