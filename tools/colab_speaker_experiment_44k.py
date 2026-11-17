@@ -126,6 +126,14 @@ def main():
              "--run-dir", RUN, "--device", "cuda", "--num-workers", "8"]
     # A reclaimed runtime loses RUN; the orchestrator re-uploads weights to warm start from.
     seed = Path("/content/adaptive-seed-checkpoint.pt")
+    parts = sorted(Path("/content").glob("seed-part-*.bin"))
+    if parts and not seed.is_file():
+        # Pieces arrive over a slow channel; stitching happens here so it never needs its own exec.
+        data = b"".join(part.read_bytes() for part in parts)
+        seed.write_bytes(data)
+        for part in parts:
+            part.unlink()
+        print(json.dumps({"event": "seed_stitched", "bytes": len(data)}), flush=True)
     if os.environ.get("SPEAKER_WAIT_SEED", "0") == "1" and not seed.is_file():
         # Uploads run beside the corpus download, so wait here instead of idling the GPU.
         deadline = time.time() + float(os.environ.get("SPEAKER_SEED_WAIT_SECONDS", "1200"))
