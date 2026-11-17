@@ -121,8 +121,7 @@ def test_extract_parquet_audio_reads_struct_speakers_and_mp3(tmp_path):
 
     shard = tmp_path / 'shard.parquet'
     table = pa.table({
-        'json': pa.array([{'speaker': 'EN_abc_SPEAKER_00'}, {'speaker': 'EN_abc_SPEAKER_01'}],
-                         type=pa.struct([('speaker', pa.string())])),
+        'speaker': pa.array(['EN_abc_SPEAKER_00', 'EN_abc_SPEAKER_01']),
         'mp3': pa.array([{'bytes': encoded(220)}, {'bytes': encoded(330)}],
                         type=pa.struct([('bytes', pa.binary())])),
     })

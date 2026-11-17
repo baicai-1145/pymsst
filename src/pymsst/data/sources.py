@@ -23,7 +23,7 @@ HF_CORPORA = {
 # Where the speaker id and the audio bytes live inside each corpus shard.
 HF_SHARD_FIELDS = {
     "vctk-hf": {"speaker": "speaker_id", "audio": "audio"},
-    "emilia-yodas-en": {"speaker": "json.speaker", "audio": "mp3"},
+    "emilia-yodas-en": {"speaker": "speaker", "audio": "mp3"},
 }
 # Speaker directory names this corpus produces, used when linking trees.
 HF_SPEAKER_PATTERNS = {"emilia-yodas-en": r"^[A-Z]{2}_[A-Za-z0-9]+_SPEAKER_\d+$"}
