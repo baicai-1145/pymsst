@@ -34,7 +34,7 @@ def prepare_manifests(root, output, *, layout="librispeech"):
         raise ValueError("a dataset directory and a supported layout are required")
     entries, seen_speakers = [], {}
     for path in sorted(root.rglob("*")):
-        if path.suffix.lower() not in {".wav", ".flac"}:
+        if path.suffix.lower() not in {".wav", ".flac", ".mp3"}:
             continue
         parts = path.relative_to(root).parts
         if layout == "librispeech":

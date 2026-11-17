@@ -69,9 +69,15 @@ def main():
 
     cli = [sys.executable, "-m", "pymsst"]
     corpora = DATA / "corpora"
+    shard_cap = int(os.environ.get("SPEAKER_MAX_SHARDS", "0")) or None
+    wanted = [name.strip() for name in os.environ.get("SPEAKER_CORPORA", "vctk-hf").split(",") if name.strip()]
     complete = {"vctk-hf": corpora / "vctk" / ".fetch_complete",
-                "vocalset": corpora / ".archives" / "vocalset.extracted"}
-    for name, marker in (("vctk-hf", corpora / "vctk"), ("vocalset", corpora / "VocalSet")):
+                "vocalset": corpora / ".archives" / "vocalset.extracted",
+                "emilia-yodas-en": corpora / "emilia-yodas-en" / ".fetch_complete"}
+    markers = {"vctk-hf": corpora / "vctk", "vocalset": corpora / "VocalSet",
+               "emilia-yodas-en": corpora / "emilia-yodas-en"}
+    for name in wanted:
+        marker = markers[name]
         if complete[name].exists():
             print(json.dumps({"event": "corpus_cached", "name": name}), flush=True)
             continue
@@ -79,6 +85,8 @@ def main():
         if marker.is_dir():
             if name == "vctk-hf":
                 whole = len([d for d in marker.iterdir() if d.is_dir() and d.name.startswith(("p", "s"))]) >= 100
+            elif name == "emilia-yodas-en":
+                whole = (marker / ".shards").is_dir() and len(list((marker / ".shards").iterdir())) >= (shard_cap or 200)
             else:
                 whole = len(list((marker / "FULL").glob("*"))) >= 20 if (marker / "FULL").is_dir() else False
             if whole:
@@ -87,14 +95,14 @@ def main():
                 print(json.dumps({"event": "corpus_adopted", "name": name}), flush=True)
                 continue
             # Resumable only when shard markers prove what is already decoded.
-            if name == "vctk-hf" and (marker / ".shards").is_dir():
+            if name in ("vctk-hf", "emilia-yodas-en") and (marker / ".shards").is_dir():
                 print(json.dumps({"event": "corpus_resuming", "name": name,
                                   "shards_done": len(list((marker / ".shards").iterdir()))}), flush=True)
                 continue
             shutil.rmtree(marker, ignore_errors=True)
             print(json.dumps({"event": "corpus_discarded", "name": name}), flush=True)
-        run([*cli, "fetch-corpus", "--name", name, "--root", corpora], label=f"fetch-{name}",
-            )
+        extra = ["--max-shards", str(shard_cap)] if shard_cap and name == "emilia-yodas-en" else []
+        run([*cli, "fetch-corpus", "--name", name, "--root", corpora, *extra], label=f"fetch-{name}")
         print(json.dumps({"event": "corpus", "name": name, "present": marker.is_dir()}), flush=True)
     linked = DATA / "speakers"
     if linked.exists():

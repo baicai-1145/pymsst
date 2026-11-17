@@ -18,9 +18,10 @@ def add_speaker_commands(subparsers):
     prepare.set_defaults(func=_prepare)
 
     fetch = subparsers.add_parser("fetch-corpus", help="Download and extract a known single-speaker corpus.")
-    fetch.add_argument("--name", required=True, choices=("vctk", "vctk-hf", "vocalset"))
+    fetch.add_argument("--name", required=True, choices=("vctk", "vctk-hf", "vocalset", "emilia-yodas-en"))
     fetch.add_argument("--root", type=Path, required=True)
     fetch.add_argument("--no-extract", action="store_true")
+    fetch.add_argument("--max-shards", type=int, default=None, help="Decode only the first N shards")
     fetch.set_defaults(func=_fetch)
 
     link = subparsers.add_parser("link-speakers", help="Normalize corpus trees into <speaker>/<audio> symlinks.")
@@ -59,7 +60,7 @@ def _fetch(args):
     from .data.sources import HF_CORPORA, download_archive, extract_archive, fetch_hf_corpus
 
     if args.name in HF_CORPORA:
-        print(json.dumps(fetch_hf_corpus(args.name, args.root)))
+        print(json.dumps(fetch_hf_corpus(args.name, args.root, max_shards=args.max_shards)))
         return 0
     archive = download_archive(args.name, args.root)
     if not args.no_extract:

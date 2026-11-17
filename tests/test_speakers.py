@@ -105,6 +105,39 @@ def test_shipped_44k_stereo_configs_build_and_forward():
         assert torch.isfinite(output.audio).all()
 
 
+def test_extract_parquet_audio_reads_struct_speakers_and_mp3(tmp_path):
+    import io
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    import soundfile as sf
+
+    from pymsst.data.sources import HF_SHARD_FIELDS, extract_parquet_audio
+
+    def encoded(frequency):
+        buffer = io.BytesIO()
+        sf.write(buffer, np.sin(2 * np.pi * frequency * np.arange(8000) / 16000).astype(np.float32), 16000, format='FLAC')
+        return buffer.getvalue()
+
+    shard = tmp_path / 'shard.parquet'
+    table = pa.table({
+        'json': pa.array([{'speaker': 'EN_abc_SPEAKER_00'}, {'speaker': 'EN_abc_SPEAKER_01'}],
+                         type=pa.struct([('speaker', pa.string())])),
+        'mp3': pa.array([{'bytes': encoded(220)}, {'bytes': encoded(330)}],
+                        type=pa.struct([('bytes', pa.binary())])),
+    })
+    pq.write_table(table, shard)
+
+    fields = HF_SHARD_FIELDS['emilia-yodas-en']
+    summary = extract_parquet_audio(shard, tmp_path / 'out', speaker_key=fields['speaker'],
+                                    audio_key=fields['audio'], prefix='emilia-yodas-en/', raw_suffix='mp3')
+    assert summary['written'] == 2 and summary['sample_rates'] == []
+    written = sorted((tmp_path / 'out').rglob('*.mp3'))
+    # compressed sources are stored as-is so the corpus fits on a Colab disk
+    assert [path.parent.name for path in written] == ['EN_abc_SPEAKER_00', 'EN_abc_SPEAKER_01']
+    assert written[0].read_bytes() == encoded(220)
+
+
 def test_link_speaker_tree_maps_corpus_layouts_and_rejects_unknown(tmp_path):
     from pymsst.data.sources import link_speaker_tree
 
