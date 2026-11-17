@@ -108,8 +108,12 @@ def extract_parquet_audio(source, output, *, speaker_key="speaker_id", audio_key
     output = Path(output)
     shard = pq.ParquetFile(source)
     written, rates = 0, set()
-    columns = sorted({speaker_key.split(".")[0], audio_key.split(".")[0]})
-    for batch in shard.iter_batches(batch_size=256, columns=columns):
+    wanted = {speaker_key.split(".")[0], audio_key.split(".")[0]}
+    available = set(shard.schema_arrow.names)
+    if not wanted <= available:
+        raise ValueError(f"{Path(source).name} lacks {sorted(wanted - available)}; "
+                         f"this shard ships {sorted(available)[:6]}...")
+    for batch in shard.iter_batches(batch_size=256, columns=sorted(wanted)):
         speakers, encoded = _column(batch, speaker_key), _column(batch, audio_key)
         for speaker, item in zip(speakers, encoded):
             payload = item.get("bytes") if isinstance(item, dict) else item
