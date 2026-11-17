@@ -96,9 +96,10 @@ def main():
                 print(json.dumps({"event": "corpus_adopted", "name": name}), flush=True)
                 continue
             # Resumable only when shard markers prove what is already decoded.
-            if name in ("vctk-hf", "emilia-yodas-en") and (marker / ".shards").is_dir():
+            decoded = list((marker / ".shards").iterdir()) if (marker / ".shards").is_dir() else []
+            if name in ("vctk-hf", "emilia-yodas-en") and decoded:
                 print(json.dumps({"event": "corpus_resuming", "name": name,
-                                  "shards_done": len(list((marker / ".shards").iterdir()))}), flush=True)
+                                  "shards_done": len(decoded)}), flush=True)
                 continue
             shutil.rmtree(marker, ignore_errors=True)
             print(json.dumps({"event": "corpus_discarded", "name": name}), flush=True)
@@ -163,7 +164,14 @@ def main():
         resumed = torch.load(RUN / "last.pt", map_location="cpu", weights_only=True)["step"]
         print(json.dumps({"event": "batch", "selected": batch, "smoke_step": resumed}), flush=True)
     if steps > 20:
-        if (RUN / "last.pt").exists():
+        if seed.is_file() and (os.environ.get("SPEAKER_FORCE_WARM", "0") == "1"
+                               or not (RUN / "last.pt").exists()):
+            stale = RUN / "last.pt"
+            if stale.exists():
+                # A checkpoint from the previous corpus cannot be resumed onto the new manifests.
+                stale.unlink()
+            carry = ["--warm-start", seed]
+        elif (RUN / "last.pt").exists():
             carry = ["--resume", RUN / "last.pt"]
         elif seed.is_file():
             # Same weights, new corpus: --resume would reject the changed manifests by design.
