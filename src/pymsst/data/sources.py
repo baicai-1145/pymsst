@@ -27,7 +27,8 @@ HF_SHARD_FIELDS = {
     "emilia-yodas-en": {"speaker": "speaker", "audio": "audio"},
 }
 # Speaker directory names this corpus produces, used when linking trees.
-HF_SPEAKER_PATTERNS = {"emilia-yodas-en": r"^[A-Z]{2}_[A-Za-z0-9]+_SPEAKER_\d+$"}
+# Emilia ids look like EN_xkiJ-Q3HtEo_SPEAKER_00, so the stem may carry - and _ characters.
+HF_SPEAKER_PATTERNS = {"emilia-yodas-en": r"^[A-Z]{2}_[A-Za-z0-9_-]+_SPEAKER_\d+$"}
 AUDIO_SUFFIXES = {".wav", ".flac", ".mp3"}
 COMPRESSED_SUFFIXES = {".mp3"}
 # macOS zips carry resource forks (__MACOSX/._*); they are audio-suffixed but not audio.
