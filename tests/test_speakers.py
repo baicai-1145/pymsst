@@ -275,7 +275,8 @@ def test_training_checkpoint_resume_and_validation(tmp_path):
     path = tmp_path / 'config.yaml'
     path.write_text(yaml.safe_dump(config))
     args = Namespace(config=path, train_manifest=train, validation_manifest=validation,
-                     run_dir=tmp_path / 'run', resume=None, device='cpu', steps=2, num_workers=0, noise_root=None)
+                     run_dir=tmp_path / 'run', resume=None, warm_start=None, device='cpu',
+                     steps=2, num_workers=0, noise_root=None)
     train_speakers(args)
     checkpoint = torch.load(args.run_dir / 'last.pt', weights_only=True)
     assert checkpoint['step'] == 2
@@ -284,6 +285,16 @@ def test_training_checkpoint_resume_and_validation(tmp_path):
     val = next(event for event in events if event['event'] == 'validation')
     assert set(val['per_count']) == {'0', '1', '2', '3', '4', '5'}
     assert 'oracle_si_sdr' not in val['per_count']['0']
+    # A different corpus invalidates --resume on purpose; --warm-start reuses the weights.
+    slim = tmp_path / 'slim.pt'
+    torch.save({'state_dict': checkpoint['state_dict'], 'step': checkpoint['step']}, slim)
+    warm = Namespace(config=path, train_manifest=train, validation_manifest=validation,
+                     run_dir=tmp_path / 'warm', resume=None, warm_start=slim, device='cpu',
+                     steps=2, num_workers=0, noise_root=None)
+    train_speakers(warm)
+    warm_events = [json.loads(line) for line in (warm.run_dir / 'history.jsonl').read_text().splitlines()]
+    assert any(event.get('event') == 'warm_start' for event in warm_events)
+    assert json.loads((warm.run_dir / 'metadata.json').read_text())['warm_start_step'] == 2
     args.resume, args.steps = args.run_dir / 'last.pt', 3
     train_speakers(args)
     assert torch.load(args.run_dir / 'last.pt', weights_only=True)['step'] == 3

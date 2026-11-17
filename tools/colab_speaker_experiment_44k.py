@@ -10,6 +10,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 import tarfile
 from pathlib import Path
 
@@ -125,6 +126,12 @@ def main():
              "--run-dir", RUN, "--device", "cuda", "--num-workers", "8"]
     # A reclaimed runtime loses RUN; the orchestrator re-uploads weights to warm start from.
     seed = Path("/content/adaptive-seed-checkpoint.pt")
+    if os.environ.get("SPEAKER_WAIT_SEED", "0") == "1" and not seed.is_file():
+        # Uploads run beside the corpus download, so wait here instead of idling the GPU.
+        deadline = time.time() + float(os.environ.get("SPEAKER_SEED_WAIT_SECONDS", "1200"))
+        while time.time() < deadline and not seed.is_file():
+            time.sleep(15)
+        print(json.dumps({"event": "seed_wait_done", "present": seed.is_file()}), flush=True)
     if seed.is_file():
         print(json.dumps({"event": "seed_available",
                           "step": torch.load(seed, map_location="cpu", weights_only=True).get("step")}), flush=True)
