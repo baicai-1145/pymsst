@@ -125,28 +125,46 @@ def main():
              "--train-manifest", manifests / "train.jsonl",
              "--validation-manifest", manifests / "validation.jsonl",
              "--run-dir", RUN, "--device", "cuda", "--num-workers", "8"]
-    # A reclaimed runtime loses RUN; the orchestrator re-uploads weights to warm start from.
+    # A reclaimed runtime loses RUN; the orchestrator re-uploads weights to continue from.
     seed = Path("/content/adaptive-seed-checkpoint.pt")
-    if os.environ.get("SPEAKER_RESUME", "0") == "1" and seed.is_file() and not (RUN / "last.pt").exists():
-        # A reclaimed runtime restarts from the uploaded checkpoint, optimiser state included.
+    expected = int(os.environ.get("SPEAKER_SEED_BYTES", "0"))
+
+    def assembled():
+        """Stitch the uploaded pieces; return the checkpoint size when it is complete."""
+        parts = sorted(Path("/content").glob("seed-part-*.bin"))
+        if parts and not seed.is_file():
+            data = b"".join(part.read_bytes() for part in parts)
+            if expected and len(data) != expected:
+                return 0  # more pieces are still in flight
+            seed.write_bytes(data)
+            for part in parts:
+                part.unlink()
+            print(json.dumps({"event": "seed_stitched", "bytes": len(data)}), flush=True)
+        if not seed.is_file():
+            return 0
+        size = seed.stat().st_size
+        return size if not expected or size == expected else 0
+
+    if os.environ.get("SPEAKER_WAIT_SEED", "0") == "1" or os.environ.get("SPEAKER_RESUME", "0") == "1":
+        deadline = time.time() + float(os.environ.get("SPEAKER_SEED_WAIT_SECONDS", "5400"))
+        while True:
+            if assembled():
+                break
+            if time.time() >= deadline:
+                print(json.dumps({"event": "seed_wait_timeout", "expected": expected}), flush=True)
+                break
+            time.sleep(20)
+    if os.environ.get("SPEAKER_RESUME", "0") == "1":
+        if not assembled():
+            # Never silently restart from zero when a continuation was requested.
+            raise SystemExit("resume requested but no complete checkpoint reached the runtime")
         RUN.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(seed, RUN / "last.pt")
-        print(json.dumps({"event": "resumed_from_upload", "step":
-                          torch.load(seed, map_location="cpu", weights_only=True).get("step")}), flush=True)
-    parts = sorted(Path("/content").glob("seed-part-*.bin"))
-    if parts and not seed.is_file():
-        # Pieces arrive over a slow channel; stitching happens here so it never needs its own exec.
-        data = b"".join(part.read_bytes() for part in parts)
-        seed.write_bytes(data)
-        for part in parts:
-            part.unlink()
-        print(json.dumps({"event": "seed_stitched", "bytes": len(data)}), flush=True)
-    if os.environ.get("SPEAKER_WAIT_SEED", "0") == "1" and not seed.is_file():
-        # Uploads run beside the corpus download, so wait here instead of idling the GPU.
-        deadline = time.time() + float(os.environ.get("SPEAKER_SEED_WAIT_SECONDS", "1200"))
-        while time.time() < deadline and not seed.is_file():
-            time.sleep(15)
-        print(json.dumps({"event": "seed_wait_done", "present": seed.is_file()}), flush=True)
+        stale = RUN / "last.pt"
+        if stale.exists():
+            stale.unlink()
+        shutil.copyfile(seed, stale)
+        print(json.dumps({"event": "resumed_from_upload",
+                          "step": torch.load(seed, map_location="cpu", weights_only=True).get("step")}), flush=True)
     if seed.is_file():
         print(json.dumps({"event": "seed_available",
                           "step": torch.load(seed, map_location="cpu", weights_only=True).get("step")}), flush=True)
@@ -169,9 +187,6 @@ def main():
             raise RuntimeError("every candidate batch size ran out of memory")
         resumed = torch.load(RUN / "last.pt", map_location="cpu", weights_only=True)["step"]
         print(json.dumps({"event": "batch", "selected": batch, "smoke_step": resumed}), flush=True)
-    if os.environ.get("SPEAKER_RESUME", "0") == "1" and not seed.is_file():
-        # Never silently restart from zero when a continuation was requested.
-        raise SystemExit("resume requested but no checkpoint reached the runtime")
     if steps > 20:
         if seed.is_file() and (os.environ.get("SPEAKER_FORCE_WARM", "0") == "1"
                                or not (RUN / "last.pt").exists()):
