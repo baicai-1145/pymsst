@@ -47,7 +47,7 @@ augmentation:
   min_active_fraction: 0.5
   empty_weight: 0.15
 loss:
-  fft_sizes: [512, 1024, 2048]
+  fft_sizes: [1024, 2048]  # the 512 band cost ~30% of loss time for little gain
   spectral_weight: 0.5
   existence_weight: 2.0
   silence_weight: 0.1
