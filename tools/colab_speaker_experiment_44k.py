@@ -169,6 +169,9 @@ def main():
             raise RuntimeError("every candidate batch size ran out of memory")
         resumed = torch.load(RUN / "last.pt", map_location="cpu", weights_only=True)["step"]
         print(json.dumps({"event": "batch", "selected": batch, "smoke_step": resumed}), flush=True)
+    if os.environ.get("SPEAKER_RESUME", "0") == "1" and not seed.is_file():
+        # Never silently restart from zero when a continuation was requested.
+        raise SystemExit("resume requested but no checkpoint reached the runtime")
     if steps > 20:
         if seed.is_file() and (os.environ.get("SPEAKER_FORCE_WARM", "0") == "1"
                                or not (RUN / "last.pt").exists()):
