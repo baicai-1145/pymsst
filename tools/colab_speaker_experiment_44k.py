@@ -127,6 +127,12 @@ def main():
              "--run-dir", RUN, "--device", "cuda", "--num-workers", "8"]
     # A reclaimed runtime loses RUN; the orchestrator re-uploads weights to warm start from.
     seed = Path("/content/adaptive-seed-checkpoint.pt")
+    if os.environ.get("SPEAKER_RESUME", "0") == "1" and seed.is_file() and not (RUN / "last.pt").exists():
+        # A reclaimed runtime restarts from the uploaded checkpoint, optimiser state included.
+        RUN.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(seed, RUN / "last.pt")
+        print(json.dumps({"event": "resumed_from_upload", "step":
+                          torch.load(seed, map_location="cpu", weights_only=True).get("step")}), flush=True)
     parts = sorted(Path("/content").glob("seed-part-*.bin"))
     if parts and not seed.is_file():
         # Pieces arrive over a slow channel; stitching happens here so it never needs its own exec.
