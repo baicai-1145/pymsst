@@ -123,13 +123,11 @@ def main():
              "--train-manifest", manifests / "train.jsonl",
              "--validation-manifest", manifests / "validation.jsonl",
              "--run-dir", RUN, "--device", "cuda", "--num-workers", "8"]
-    # A reclaimed runtime loses RUN; continue from the checkpoint the orchestrator re-uploads.
+    # A reclaimed runtime loses RUN; the orchestrator re-uploads weights to warm start from.
     seed = Path("/content/adaptive-seed-checkpoint.pt")
-    if seed.is_file() and not (RUN / "last.pt").exists():
-        RUN.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(seed, RUN / "last.pt")
-        print(json.dumps({"event": "resumed_from_uploaded_checkpoint",
-                          "step": torch.load(seed, map_location="cpu", weights_only=True)["step"]}), flush=True)
+    if seed.is_file():
+        print(json.dumps({"event": "seed_available",
+                          "step": torch.load(seed, map_location="cpu", weights_only=True).get("step")}), flush=True)
     # Fill the card: start big and step down only if the allocator refuses.
     wanted = int(os.environ.get("SPEAKER_BATCH", "8"))
     candidates = [wanted] + [size for size in (8, 4, 2, 1) if size < wanted]
@@ -150,7 +148,14 @@ def main():
         resumed = torch.load(RUN / "last.pt", map_location="cpu", weights_only=True)["step"]
         print(json.dumps({"event": "batch", "selected": batch, "smoke_step": resumed}), flush=True)
     if steps > 20:
-        run([*train, "--steps", str(steps), "--resume", RUN / "last.pt", "--batch-size", str(batch)], label="train")
+        if (RUN / "last.pt").exists():
+            carry = ["--resume", RUN / "last.pt"]
+        elif seed.is_file():
+            # Same weights, new corpus: --resume would reject the changed manifests by design.
+            carry = ["--warm-start", seed]
+        else:
+            carry = []
+        run([*train, "--steps", str(steps), *carry, "--batch-size", str(batch)], label="train")
 
     import soundfile as sf
     from pymss_core import get_model_from_config

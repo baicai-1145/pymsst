@@ -92,6 +92,15 @@ def train_speakers(args):
     if use_amp and not torch.cuda.is_bf16_supported():
         raise ValueError("this training recipe uses bf16; disable amp on GPUs without bf16 support")
     step, best = 0, float("inf")
+    warm_started = 0
+    if getattr(args, "warm_start", None):
+        # Reuse the learned weights on a different corpus; --resume stays strict about manifests.
+        package = torch.load(args.warm_start, map_location="cpu", weights_only=True)
+        state = package.get("state_dict", package)
+        model.load_state_dict(state, strict=True)
+        warm_started = int(package.get("step", 0) or 0)
+        print(json.dumps({"event": "warm_start", "checkpoint_step": warm_started,
+                          "parameters": sum(p.numel() for p in model.parameters())}), flush=True)
     if args.resume:
         package = torch.load(args.resume, map_location="cpu", weights_only=True)
         previous = package["config"]
@@ -108,7 +117,8 @@ def train_speakers(args):
     metadata = {"device": str(device), "gpu": torch.cuda.get_device_name(device) if device.type == "cuda" else None,
                     "parameters": sum(p.numel() for p in model.parameters()), "seed": seed, "manifest_sha256": fingerprint,
                     "train_speakers": len(train.speakers), "validation_speakers": len(validation.speakers),
-                    "training_max_speakers": maximum, "validation_seed": validation.seed}
+                    "training_max_speakers": maximum, "validation_seed": validation.seed,
+                    "warm_start_step": warm_started}
     (run / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
     print(json.dumps(dict(event="start", step=step, **metadata)), flush=True)
     loss_options = config.get("loss", {})

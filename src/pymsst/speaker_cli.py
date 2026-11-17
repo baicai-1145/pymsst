@@ -36,6 +36,8 @@ def add_speaker_commands(subparsers):
     train.add_argument("--validation-manifest", type=Path, required=True)
     train.add_argument("--run-dir", type=Path, required=True)
     train.add_argument("--resume", type=Path)
+    train.add_argument("--warm-start", type=Path,
+                       help="Load model weights only, for continuing on a different corpus.")
     train.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda", "mps"))
     train.add_argument("--steps", type=int)
     train.add_argument("--batch-size", type=int, help="Override training.batch_size; sized to the device.")
