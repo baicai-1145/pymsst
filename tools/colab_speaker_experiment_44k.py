@@ -240,10 +240,31 @@ def main():
         directory = examples / f"{count}_speakers"
         directory.mkdir(exist_ok=True)
         sf.write(directory / "mixture.wav", mixture.T.numpy(), test.sample_rate, subtype="FLOAT")
-        for i in range(min(count, 2)):
-            sf.write(directory / f"reference_{i + 1}.wav", target[i].T.numpy(), test.sample_rate, subtype="FLOAT")
-        for i in range(min(predicted, 5)):
-            sf.write(directory / f"prediction_{i + 1}.wav", output.audio[0, i].T.cpu().numpy(), test.sample_rate, subtype="FLOAT")
+        stems_out = output.audio[0, :min(predicted, 5)].T.cpu().numpy()
+        stems_ref = target[:min(count, 5)].T.numpy()
+
+        def si_sdr(estimate, reference):
+            noise = estimate - reference
+            return float((reference ** 2).sum() / max(float((noise ** 2).sum()), 1e-12))
+
+        # Slot order means nothing across model and target, so match them by agreement and
+        # write every prediction next to the reference it reproduces.
+        scores = [[si_sdr(stems_out[i], stems_ref[j]) for j in range(len(stems_ref))]
+                  for i in range(len(stems_out))]
+        remaining = list(range(len(stems_ref)))
+        ordered = []
+        for _ in range(len(stems_ref)):
+            if not remaining or not len(stems_out):
+                break
+            best = max(((scores[i][j], i, j) for i in range(len(stems_out)) for j in remaining))
+            ordered.append(stems_out[best[1]])
+            remaining.remove(best[2])
+            stems_out = [stem for index, stem in enumerate(stems_out) if index != best[1]]
+            scores = [[row[j] for j in remaining] for index, row in enumerate(scores) if index != best[1]]
+        for j in range(len(stems_ref)):
+            sf.write(directory / f"reference_{j + 1}.wav", stems_ref[j], test.sample_rate, subtype="FLOAT")
+            if j < len(ordered):
+                sf.write(directory / f"prediction_{j + 1}.wav", ordered[j], test.sample_rate, subtype="FLOAT")
         summaries.append({"reference_speakers": count, "predicted_speakers": predicted,
                           "limit_reached": bool(output.at_limit()[0])})
     (RUN / "example_counts.json").write_text(json.dumps(summaries, indent=2) + "\n")
