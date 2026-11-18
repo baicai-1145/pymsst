@@ -99,8 +99,12 @@ def train_speakers(args):
         state = package.get("state_dict", package)
         model.load_state_dict(state, strict=True)
         warm_started = int(package.get("step", 0) or 0)
-        print(json.dumps({"event": "warm_start", "checkpoint_step": warm_started,
-                          "parameters": sum(p.numel() for p in model.parameters())}), flush=True)
+        warm_event = {"event": "warm_start", "checkpoint_step": warm_started,
+                      "parameters": sum(p.numel() for p in model.parameters())}
+        print(json.dumps(warm_event), flush=True)
+        # The orchestrator reads history.jsonl, so the event has to land there too.
+        with (run / "history.jsonl").open("a", buffering=1) as warm_history:
+            warm_history.write(json.dumps(warm_event) + "\n")
     if args.resume:
         package = torch.load(args.resume, map_location="cpu", weights_only=True)
         previous = package["config"]
