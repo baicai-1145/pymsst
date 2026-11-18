@@ -79,7 +79,8 @@ def train_speakers(args):
                   "channels": model.audio_channels}
     train = SpeakerMixtureDataset(args.train_manifest, samples_per_epoch=steps_per_epoch * batch_size, seed=seed, **common)
     validation = SpeakerMixtureDataset(args.validation_manifest, samples_per_epoch=val_samples,
-                                       seed=seed + 1000000, validation=True, **common)
+                                       seed=seed + 1000000, validation=True,
+                                       **{**common, "augment": False})
     fingerprint = {name: hashlib.sha256(Path(path).read_bytes()).hexdigest()
                    for name, path in (("train", args.train_manifest), ("validation", args.validation_manifest))}
     run = Path(args.run_dir)
