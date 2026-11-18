@@ -45,6 +45,17 @@ Metrics are produced by `python -m pymsst train-speakers` at the end of a run an
 - `count_accuracy` / `count_mae`: how often the predicted speaker count matches the truth
 - `per_count`: the same metrics split by the true number of speakers
 
+Reference points from the released checkpoint (`seeds/slim-00500.pt` weights, evaluated on the
+held-out test split of 7,642 utterances / 262 identities):
+
+| Split | SI-SDRi | count accuracy | count MAE |
+| --- | --- | --- | --- |
+| test | 10.55 | 0.85 | 0.17 |
+| test (clean subset) | 10.54 | 0.83 | 0.17 |
+
+Per speaker count (test): 2 speakers 12.60 dB, 3 speakers 10.38 dB, 4 speakers 10.59 dB,
+5 speakers 8.62 dB.
+
 Reference points from the development runs (validation split, 262 unseen identities):
 
 | Step | SI-SDRi | count accuracy | count MAE |
