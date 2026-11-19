@@ -196,6 +196,7 @@ def _train(args: argparse.Namespace) -> int:
     import pytorch_lightning as pl
     import torch
     from pytorch_lightning.callbacks import ModelCheckpoint
+    CHECKPOINT_EVERY_N_STEPS = 500
     from pytorch_lightning.loggers import CSVLogger, TensorBoardLogger
     from pymss_core import to_plain
 
@@ -334,6 +335,7 @@ def _train(args: argparse.Namespace) -> int:
             dirpath=run_dir / "checkpoints",
             filename="{epoch:03d}-{step:06d}",
             save_last=True,
+            every_n_train_steps=CHECKPOINT_EVERY_N_STEPS,
             save_top_k=0,
             save_on_train_epoch_end=True,
             auto_insert_metric_name=False,
@@ -345,6 +347,7 @@ def _train(args: argparse.Namespace) -> int:
             monitor="val_sdr",
             mode="max",
             save_last=True,
+            every_n_train_steps=CHECKPOINT_EVERY_N_STEPS,
             save_top_k=1,
             save_on_train_epoch_end=False,
             auto_insert_metric_name=False,

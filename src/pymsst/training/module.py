@@ -235,6 +235,10 @@ class SeparationLightningModule(pl.LightningModule):
             coarse=self.coarse_loss_clip,
             original_shape_compat=self.original_loss_compat,
         )
+        moe_aux = self.model.pop_moe_aux_loss() if hasattr(self.model, "pop_moe_aux_loss") else None
+        if moe_aux is not None:
+            loss = loss + 0.01 * moe_aux
+            self.log("train/moe_aux", moe_aux, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
         if self.train_log_interval and (batch_idx + 1) % self.train_log_interval == 0:
             self.log("train/loss", loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
             self.log("loss", loss * 100.0, on_step=True, on_epoch=False, sync_dist=True)
